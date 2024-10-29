@@ -142,8 +142,8 @@ def sparse_permute(x, perm):
     new_indices = x.indices()[list(perm)]
     return t.sparse_coo_tensor(new_indices, x.values(), tuple(x.shape[perm[i]] for i in range(len(perm))))
 
-def rearrange_weights(nodes, edges):
-    # rearrange weight matrices
+def __old__rearrange_weights(nodes, edges):
+    # rearrange weight matrices # dict : upstream -> downstream -> weight_matrix
     for child in edges:
         # get shape for child
         bc, sc, fc = nodes[child].act.shape
@@ -156,6 +156,22 @@ def rearrange_weights(nodes, edges):
                 assert bp == bc
                 weight_matrix = sparse_reshape(weight_matrix, (bp, sp, fp+1, bc, sc, fc+1))
             edges[child][parent] = weight_matrix
+
+def rearrange_weights(shapes, edges):
+    # rearrange weight matrices # dict : downstream -> upstream -> weight_matrix
+    for downstream in edges:
+        # get shape for child
+        if downstream != 'y':
+            bd, sd, fd = shapes[downstream]
+        for upstream in edges[downstream]:
+            bu, su, fu = shapes[upstream]
+            weight_matrix = edges[downstream][upstream]
+            if downstream == 'y':
+                weight_matrix = sparse_reshape(weight_matrix, (bd, sd, fd+1))
+            else:
+                assert bd == bu
+                weight_matrix = sparse_reshape(weight_matrix, (bd, sd, fd+1, bu, su, fu+1))
+            edges[downstream][upstream] = weight_matrix
 
 def _save_all_batch(nodes, edges, aggregation, base_dir=None):
     # TODO : save also the sequence, trg idx and trg
@@ -191,7 +207,7 @@ def _save_all_batch(nodes, edges, aggregation, base_dir=None):
         with open(f'{base_dir}{file_name}', 'wb') as outfile:
             t.save(save_dir, outfile)
 
-def aggregate_weights(
+def __old__aggregate_weights(
     nodes, edges, aggregation='max', dump_all=False, save_path=None
 ):
     if aggregation == 'sum':
@@ -235,3 +251,44 @@ def aggregate_weights(
         _save_all_batch(nodes, edges, aggregation, base_dir=save_path)
     # aggregate across batch dimension
     _aggregate(w_y_b_fct, w_b_fct, n_b_fct)
+
+def aggregate_weights(
+    shapes, edges, aggregation='sum', dump_all=False, save_path=None
+):
+    if dump_all:
+        raise NotImplementedError("dump_all is not implemented in the new version of aggregate_weights")
+    
+    if aggregation == 'sum':
+        w_y_s_fct = lambda w, b: w.sum(dim=1)
+        w_s_fct = lambda w, b: w.sum(dim=(1, 4))
+
+        w_y_b_fct = lambda w, b: w.sum(dim=0) / b
+        w_b_fct = lambda w, b: w.sum(dim=(0, 2)) / b # TODO : shouldn't this be / (b**2) ?
+    elif aggregation == 'max':
+        w_y_s_fct = lambda w, b: sparse_coo_amax(w, dim=1)
+        w_s_fct = lambda w, b: sparse_coo_amax(w, dim=(1, 4))
+
+        w_y_b_fct = lambda w, b: sparse_coo_amax(w, dim=0)
+        w_b_fct = lambda w, b: sparse_coo_amax(w, dim=(0, 2))
+    else:
+        raise ValueError(f"Unknown aggregation: {aggregation}")
+
+    def _aggregate(w_y_fct, w_fct):
+        for downstream in edges:
+            for upstream in edges[downstream]:
+                shape = shapes[upstream]
+                b = shape[0]
+                weight_matrix = edges[downstream][upstream]
+                if downstream == 'y':
+                    weight_matrix = w_y_fct(weight_matrix, b)
+                else:
+                    weight_matrix = w_fct(weight_matrix, b)
+                edges[downstream][upstream] = weight_matrix
+
+    # aggregate across sequence position
+    _aggregate(w_y_s_fct, w_s_fct)
+    # dump all examples
+    # if dump_all:
+    #     _save_all_batch(nodes, edges, aggregation, base_dir=save_path)
+    # aggregate across batch dimension
+    _aggregate(w_y_b_fct, w_b_fct)

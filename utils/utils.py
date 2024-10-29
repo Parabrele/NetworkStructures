@@ -3,6 +3,16 @@ import random
 import torch as t
 import torch.nn.functional as F
 
+class Submod:
+    """
+    A Submod is a helper class which contains a submodule of a model, along with an optional LayerNorm module
+    that is applied before the submodule.
+    """
+    def __init__(self, name, module, LN=None):
+        self.name = name
+        self.module = module
+        self.LN = LN
+
 # TODO : RC task
 
 def load_examples(dataset, num_examples, model, seed=12, pad_to_length=None, length=None):

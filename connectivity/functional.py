@@ -8,7 +8,7 @@ from welford_torch import OnlineCovariance
 
 from tqdm import tqdm
 
-from utils.activation import get_hidden_states, get_hidden_attr
+from utils.activation import get_is_tuple, get_hidden_states, get_hidden_attr
 from utils.metric_fns import metric_fn_logit
 from utils.ablation_fns import zero_ablation
 from data.buffer import unpack_batch
@@ -51,11 +51,8 @@ def generate_cov(
         for submod in submods:
             cov['act'][submod] = OnlineCovariance()
     
-    # dummy forward pass to get shapes of outputs
-    is_tuple = {}
-    with model.trace("_"), torch.no_grad():
-        for submodule in submods:
-            is_tuple[submodule] = type(submodule.output.shape) == tuple
+    # get the shape of the hidden states
+    is_tuple = get_is_tuple(model, submods)
     
     # there is an annoying bug with multiprocessing and nnsight. Don't use multiprocessing for now.
     i = 0

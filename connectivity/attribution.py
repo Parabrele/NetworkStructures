@@ -14,6 +14,177 @@ if DEBUGGING:
 else:
     tracer_kwargs = {'validate' : False, 'scan' : False}
 
+@t.no_grad()
+def get_feature_effect(
+    model,
+    clean, hidden_states_clean, hidden_states_patch,
+    dictionaries,
+    downstream, # str : downstream module
+    upstreams, # list of str : modules upstream of downstream
+    name2mod, # dict str -> Submodule : name to module
+    features_by_submod,
+    is_tuple, steps,
+    edge_threshold,
+    metric_fn, metric_kwargs=dict(),
+):
+    """
+    Get the effect of some upstream module on some downstream module. Uses integrated gradient attribution.
+    """
+    try:
+        downstream_features = features_by_submod[downstream]
+    except KeyError:
+        raise ValueError(f"Module {downstream} has no features to compute effects for")
+
+    if hasattr(model, 'device'):
+        device = model.device
+    elif hasattr(model, 'cfg'):
+        device = model.cfg.device
+    else:
+        raise ValueError("Can't get model device :c")
+
+    #print(f"Computing effects for layer {layer} with {len(downstream_features)} features")
+
+    if not features_by_submod[downstream]: # handle empty list
+        raise ValueError(f"Module {downstream} has no features to compute effects for")
+    
+    downstream_submod = name2mod[downstream]
+    
+    effect_indices = {}
+    effect_values = {}
+    clean_states = [hidden_states_clean[upstream_submod] for upstream_submod in upstreams]
+    patch_states = [hidden_states_patch[upstream_submod] for upstream_submod in upstreams]
+
+    effect_indices = {}
+    effect_values = {}
+    for downstream_feat in downstream_features:
+        metrics = []
+        fs = {}
+
+        for step in range(1, steps+1):
+            alpha = step / steps
+
+            reconstructed_input = 0
+
+            for upstream_name in upstreams:
+                upstream_act = (1 - alpha) * clean_states[upstream_name] + alpha * patch_states[upstream_name] # act shape (batch_size, seq_len, n_features) res shape (batch_size, seq_len, d_model)
+                upstream_act.act = upstream_act.act.clone().detach().requires_grad_(True).retain_grad()
+                upstream_act.res = upstream_act.res.clone().detach().requires_grad_(True).retain_grad()
+
+                if fs.get(upstream_name) is None:
+                    fs[upstream_name] = []
+                fs[upstream_name].append(upstream_act)
+                
+                reconstructed_input += dictionaries[upstream_name].decode(upstream_act.act) + upstream_act.res
+            
+            if downstream != 'y':
+                # TODO raise NotImplementedError("Check how to deal with inputs for all different modules !")
+                # get the new output of the downstream module.
+                if downstream_submod.LN is not None:
+                    ln = downstream_submod.LN.forward(reconstructed_input)
+                    y = downstream_submod.module.forward(ln)
+                else:
+                    y = downstream_submod.module.forward(reconstructed_input)
+                
+                y_hat, g = dictionaries[downstream](y, output_features=True)
+                y_res = y - y_hat
+                downstream_act = SparseAct(
+                    act=g,
+                    res=y_res
+                )
+                
+                # Now, modify current feature in the downstream module's output and compute the effect on the metric
+                if downstream_feat == downstream_act.act.size(-1):
+                    diff = downstream_act.res - clean_states[downstream_submod].res
+                else:
+                    # Get the scalar value (coeff) of the downstream feature
+                    diff = downstream_act.act[..., downstream_feat] - clean_states[downstream_submod].act[..., downstream_feat]
+                    # Use this to scale the target feature vector
+                    diff = diff * dictionaries[downstream].decoder.weight[:, downstream_feat]
+            
+                with model.trace(clean, **tracer_kwargs):
+                    if is_tuple[downstream]:
+                        downstream_submod.output[0] += diff # downstream_act - clean_states Remove the current feature's effect and add it's patched effect
+                    else:
+                        downstream_submod.output += diff
+
+                    metrics.append(metric_fn(model, metric_kwargs))
+            
+            else:
+                with model.trace(clean, **tracer_kwargs):
+                    if is_tuple[downstream]:
+                        downstream_submod.output[0] = reconstructed_input
+                    else:
+                        downstream_submod.output = reconstructed_input
+
+                    metrics.append(metric_fn(model, metric_kwargs))
+
+
+        metric = sum([m for m in metrics])
+        metric.sum().backward(retain_graph=True)
+
+        for upstream_name in upstreams:
+            mean_act_grad = sum([f.act.grad for f in fs[upstream_name]]) / steps
+            mean_res_grad = sum([f.res.grad for f in fs[upstream_name]]) / steps
+
+            grad = SparseAct(act=mean_act_grad, res=mean_res_grad)
+            delta = (patch_states[upstream_name] - clean_states[upstream_name]).detach()
+
+            if effect_indices.get(upstream_name) is None:
+                effect_indices[upstream_name] = {}
+                effect_values[upstream_name] = {}
+
+            effect = (grad @ delta).abs()
+
+            effect_indices[upstream_name][downstream_feat] = t.where(
+                effect.abs() > edge_threshold,
+                effect,
+                t.zeros_like(effect)
+            ).nonzero().squeeze(-1)
+
+            effect_values[upstream_name][downstream_feat] = effect[effect_indices[upstream_name][downstream_feat]]
+
+    # get shapes for the return sparse tensors
+    d_downstream_contracted = t.tensor(hidden_states_clean[downstream].act.size() if downstream != 'y' else (0,)) # if downstream == 'y', then the output is a single scalar
+    d_downstream_contracted[-1] += 1
+    d_downstream_contracted = d_downstream_contracted.prod()
+
+    d_upstream_contracted = {}
+    for upstream_name in upstreams:
+        d_upstream_contracted[upstream_name] = t.tensor(clean_states[upstream_name].act.size())
+        d_upstream_contracted[upstream_name][-1] += 1
+        d_upstream_contracted[upstream_name] = d_upstream_contracted[upstream_name].prod
+
+    # Create the sparse_coo_tensor containing the effect of each upstream module on the downstream module
+    effects = {}
+    for upstream_name in upstreams:
+        # converts the dictionary of indices to a tensor of indices
+        effect_indices[upstream_name] = t.tensor(
+            [[downstream_feat for downstream_feat in downstream_features for _ in effect_indices[upstream_name][downstream_feat]],
+            t.cat([effect_indices[upstream_name][downstream_feat] for downstream_feat in downstream_features], dim=0)]
+        ).to(device).long()
+        effect_values[upstream_name] = t.cat([effect_values[upstream_name][downstream_feat] for downstream_feat in downstream_features], dim=0)
+
+        potential_upstream_features = effect_indices[upstream_name][1] # list of indices
+        
+        # TODO : use upstream_mask like in __old_get_effect :
+        # upstream_mask = nodes[upstream_name].to_tensor().flatten()[potential_upstream_features].abs() > node_threshold
+        if features_by_submod.get(upstream_name) is None:
+            features_by_submod[upstream_name] = potential_upstream_features.unique().tolist()
+        else:
+            features_by_submod[upstream_name] += potential_upstream_features.unique().tolist()
+            features_by_submod[upstream_name] = list(set(features_by_submod[upstream_name]))
+
+        effects[upstream_name] = t.sparse_coo_tensor(
+            effect_indices[upstream_name], effect_values[upstream_name],
+            (d_downstream_contracted, d_upstream_contracted[upstream_name])
+        )
+
+    return effects
+
+##########
+# Old functions, not really used anymore
+##########
+
 EffectOut = namedtuple('EffectOut', ['effects', 'deltas', 'grads', 'total_effect'])
 
 def y_effect(
@@ -102,7 +273,7 @@ def y_effect(
     return last_effect, node_effects
 
 @t.no_grad()
-def get_effect(
+def __old_get_effect(
     model,
     clean,
     hidden_states_clean,
@@ -776,7 +947,6 @@ def jvp(
     d_upstream_contracted = len((upstream_act.value @ upstream_act.value).to_tensor().flatten())
     if return_without_right:
         d_upstream = len(upstream_act.value.to_tensor().flatten())
-
 
     vjv_indices = t.tensor(
         [[downstream_feat for downstream_feat in downstream_features for _ in vjv_indices[downstream_feat].value],

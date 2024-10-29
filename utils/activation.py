@@ -310,6 +310,13 @@ if DEBUGGING:
 else:
     tracer_kwargs = {'validate' : False, 'scan' : False}
 
+def get_is_tuple(model, submods):
+    # dummy forward pass to get shapes of outputs
+    is_tuple = {}
+    with model.trace("_"), t.no_grad():
+        for submodule in submods:
+            is_tuple[submodule.name] = type(submodule.output.shape) == tuple
+
 def get_hidden_states(
     model,
     submods,
@@ -321,17 +328,17 @@ def get_hidden_states(
     hidden_states = {}
     with model.trace(input, **tracer_kwargs), t.no_grad():
         for submodule in submods:
-            dictionary = dictionaries[submodule]
-            x = submodule.output
-            if is_tuple[submodule]:
+            dictionary = dictionaries[submodule.name]
+            x = submodule.module.output
+            if is_tuple[submodule.name]:
                 x = x[0]
             
             if reconstruction_error:
                 x_hat, f = dictionary(x, output_features=True)
-                hidden_states[submodule] = SparseAct(act=f.save(), res=(x - x_hat).save())
+                hidden_states[submodule.name] = SparseAct(act=f.save(), res=(x - x_hat).save())
             else:
                 f = dictionary.encode(x)
-                hidden_states[submodule] = SparseAct(act=f.save())
+                hidden_states[submodule.name] = SparseAct(act=f.save())
     hidden_states = {k : v.value for k, v in hidden_states.items()}
     return hidden_states
 
@@ -356,9 +363,9 @@ def get_hidden_attr(
     
     hidden_attr = {}
     for submod in submods:
-        dictionary = dictionaries[submod]
-        clean_state = hidden_states_clean[submod]
-        patch_state = hidden_states_patch[submod]
+        dictionary = dictionaries[submod.name]
+        clean_state = hidden_states_clean[submod.name]
+        patch_state = hidden_states_patch[submod.name]
 
         with model.trace(**tracer_kwargs) as tracer:
             metrics = []
@@ -370,10 +377,10 @@ def get_hidden_attr(
                 upstream_act.res.retain_grad()
                 fs.append(upstream_act)
                 with tracer.invoke(input, scan=tracer_kwargs['scan']):
-                    if is_tuple[submod]:
-                        submod.output[0][:] = dictionary.decode(upstream_act.act) + upstream_act.res
+                    if is_tuple[submod.name]:
+                        submod.module.output[0][:] = dictionary.decode(upstream_act.act) + upstream_act.res
                     else:
-                        submod.output = dictionary.decode(upstream_act.act) + upstream_act.res
+                        submod.module.output = dictionary.decode(upstream_act.act) + upstream_act.res
                     metrics.append(metric_fn(model, metric_kwargs))
             metric = sum([m for m in metrics])
             metric.sum().backward(retain_graph=True)
@@ -386,6 +393,6 @@ def get_hidden_attr(
             grad = SparseAct(act=mean_grad)
         delta = (patch_state - clean_state).detach() if patch_state is not None else -clean_state.detach()
         effect = (grad @ delta).abs()
-        hidden_attr[submod] = effect
+        hidden_attr[submod.name] = effect
 
     return hidden_attr

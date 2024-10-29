@@ -1,11 +1,9 @@
 import gc
 
-from collections import defaultdict
-
 import torch as t
 
-from connectivity.attribution import y_effect, get_effect
-from utils.activation import get_hidden_states
+from connectivity.attribution import y_effect, __old_get_effect, get_feature_effect
+from utils.activation import get_is_tuple, get_hidden_states
 from utils.sparse_coo_helper import rearrange_weights, aggregate_weights
 
 def get_circuit(
@@ -28,7 +26,7 @@ def get_circuit(
     dump_all=False,
     save_path=None,
 ):
-    return get_circuit_feature_resid_only(
+    return __old__get_circuit_feature_resid_only(
         clean,
         patch,
         model,
@@ -50,7 +48,7 @@ def get_circuit(
     )
 
 # TODO : remove this function. Should be a special case of get_circuit_feature
-def get_circuit_feature_resid_only(
+def __old__get_circuit_feature_resid_only(
         clean,
         patch,
         model,
@@ -77,11 +75,8 @@ def get_circuit_feature_resid_only(
     last_layer = resids[-1]
     n_layers = len(resids)
     
-    # dummy forward pass to get shapes of outputs
-    is_tuple = {}
-    with model.trace("_"), t.no_grad():
-        for submodule in all_submods:
-            is_tuple[submodule] = type(submodule.output.shape) == tuple
+    # get the shape of the hidden states
+    is_tuple = get_is_tuple(model, all_submods)
 
     if use_start_at_layer:
         raise NotImplementedError
@@ -123,7 +118,7 @@ def get_circuit_feature_resid_only(
         print(nodes.keys())
         return nodes, {}
     
-    edges = defaultdict(lambda:{})
+    edges = {}
     edges[f'resid_{len(resids)-1}'] = {'y' : edge_effect}
     
     # Now, backward through the model to get the effects of each layer on its successor.
@@ -137,7 +132,7 @@ def get_circuit_feature_resid_only(
         else:
             prev_resid = embed
 
-        RR_effect = get_effect(
+        RR_effect = __old_get_effect(
             model,
             clean, hidden_states_clean, hidden_states_patch,
             dictionaries,
@@ -163,26 +158,111 @@ def get_circuit_feature_resid_only(
     return nodes, edges
 
 def get_circuit_feature(
-        clean,
-        patch,
-        model,
+        clean, # Tokenized clean input
+        patch, # Tokenized patch input (optional)
+        model, # Unified transformer (from nnsight)
+               # model to interpret
         architectural_graph, # dict of downstream -> upstream modules.
+                             # The architecture graph of model.
                              # The sink is 'y' and all necessary modules and connections should be included in this graph.
-        name2submod, # dict str -> submod # TODO : special class for submods to include potential LNs ?
-        dictionaries,
-        metric_fn,
-        metric_kwargs=dict(),
-        ablation_fn=None,
-        aggregation='max', # or 'none' for not aggregating across sequence position
-        node_threshold=0.1,
-        edge_threshold=0.01,
-        nodes_only=False,
-        steps=10,
+                             # In this dict, modules are represented by their names (str).
+        name2mod, # dict str -> Submod
+        dictionaries, # dict of str -> SAE
+                      # The feature dictionaries to use for the interpretation.
+                      # Should be at least one for every module appearing in the architecture graph.
+        metric_fn, # callable
+                   # Scalar metric function representing what we want to measure from the model.
+                   # e.g. if one wants to make a computational graph, the target logits can be used.
+                   #      if one wants to compute the circuit for responsible for a specific feature / probe / ... in
+                   #      the hidden states, the activation of that feature (resp. the output of the probe) can be used.
+        metric_kwargs=dict(), # dict
+                              # Additional arguments to pass to the metric function.
+                              # e.g. if the metric function is the logit, one should add the position of the target logit.
+        ablation_fn=None, # callable
+                          # Ablation function used for integrated gradient. Applied to the patched hidden states.
+                          # The results gives the baseline for the integrated gradients.
+        aggregation='sum', # str
+                           # Method to aggregate the edge weights across sequence positions and batch elements.
+                           # Supported methods are 'sum' and 'max'. 
+        node_threshold=0.1, # float. Threshold for node pruning.
+                            # When a node's importance is below this threshold, it is not even considered for
+                            # the backward computation of the effects.
+                            # Trade-off between speed and accuracy.
+        edge_threshold=0.01, # float. Threshold for edge pruning.
+                             # When all edges leaving a node have a weight below this threshold, the node is pruned
+                             # and the result is equivalent to the node being below the 'node_threshold'.
+        nodes_only=False, # bool. Whether to return only the nodes using node_threshold and not computing any
+                          # dependency between them. The resulting 'graph' is complete between the remaining nodes.
+        steps=10, # int. Number of steps for the integrated gradients.
+                  # When this value equals 1, only one gradient step is computed and the method is equivalent to
+                  # the Attribution Patching's paper method.
 ):
     """
     When feature dictionaries are not partitioned (~ endowed with the discrete partition)
     it would be stupid to actually consider the discrete partition. This implementation is faster.
     """
+    # gather all modules involved in the computation : start from 'y' and do a reachability search.
+    visited = set()
+    to_visit = ['y']
+    while to_visit:
+        downstream = to_visit.pop()
+        if downstream in visited:
+            continue
+        visited.add(downstream)
+        to_visit += architectural_graph[downstream]
+        
+    all_submods = list(visited).remove('y')
+    
+    # get the shape of the hidden states
+    is_tuple = get_is_tuple(model, all_submods)
+
+    # get hidden states for clean and patch inputs
+    hidden_states_clean = get_hidden_states(
+        model, submods=all_submods, dictionaries=dictionaries, is_tuple=is_tuple, input=clean
+    )
+
+    if patch is None:
+        patch = clean
+
+    hidden_states_patch = get_hidden_states(
+        model, submods=all_submods, dictionaries=dictionaries, is_tuple=is_tuple, input=patch
+    )
+    hidden_states_patch = {k : ablation_fn(v) for k, v in hidden_states_patch.items()}
+
+    features_by_submod = {'y' : [0]}
+    
+    # Backward through the graph to get effects of upstream modules on downstream modules. Start from 'y'.
+    visited = set()
+    to_visit = ['y']
+    edges = {}
+    while to_visit:
+        downstream = to_visit.pop()
+        if downstream in visited:
+            continue
+        visited.add(downstream)
+        to_visit += architectural_graph[downstream]
+
+        # TODO : for nodes, use direct paths and consider 'y' -> all_upstream for the architecture graph to feed to get effect
+
+        edges[downstream] = get_feature_effect(
+            model,
+            clean, hidden_states_clean, hidden_states_patch,
+            dictionaries,
+            downstream,
+            architectural_graph[downstream],
+            name2mod,
+            features_by_submod,
+            is_tuple, steps,
+            edge_threshold,
+            metric_fn, metric_kwargs=metric_kwargs,
+        ) # return a dict of upstream -> effect
+    
+    # Now, aggregate the weights across sequence positions and batch elements.
+    shapes = {k : hidden_states_clean[k].act.shape for k in all_submods}
+
+    rearrange_weights(shapes, edges)
+    aggregate_weights(shapes, edges, aggregation)
+
     return
 
 def get_circuit_roi():
