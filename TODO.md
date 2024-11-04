@@ -1,3 +1,6 @@
+## URGENT :
+- Look into pre/post ln : e.g. gemma seems to use ln(module(ln(resid))). More generally consider that SAEs might be attached to different points.
+
 ## ROIs :
 - find and save the ROIs for any dictionary
     - extract activation & attribution vector from modules
@@ -58,3 +61,16 @@
             - same
             - do it in appendix ? No, this is also super important, but it might seem a bit redundant and take a lot of space
     - bias in bios : node vs edge
+
+## ROI attribution :
+
+divide by N = # of feature in ROI ? Otherwise, inner product will be naturally higher for larger ROIs.
+Sparsity of SAEs : this might not be required as only a small number of features will be active at a time. If this number, is typically smaller than the size of ROIs, the problem will not appear, and dividing by N will actualy penalize larger ROIs.
+
+## Misc :
+- Check that masked graphs edge ablation with threshold >> 1 has no connection (not even res - res)
+- Do a complete run step by step in a notebook to check that everything behaves as expected on the right objects.
+- Better visualisations
+    - for node/edge ablation : with clean, patch/baseline and patch forwards
+    - for attribution : forward pass with only relevant edges impacted
+- if no embed SAE : do get_circuit with a graph that excludes embed, then for inference manually set the embed SAE to Identity and all edges 1... Not satisfying : later layer likely do not use the original embeding informations. Alternatively, start with a resid SAE from layer 0 (skip layer 1).

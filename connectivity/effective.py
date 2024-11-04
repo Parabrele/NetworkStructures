@@ -211,7 +211,9 @@ def get_circuit_feature(
         visited.add(downstream)
         to_visit += architectural_graph[downstream]
         
-    all_submods = list(visited).remove('y')
+    all_submods = list(visited)
+    all_submods.remove('y')
+    all_submods = [name2mod[name] for name in all_submods]
     
     # get the shape of the hidden states
     is_tuple = get_is_tuple(model, all_submods)
@@ -258,7 +260,7 @@ def get_circuit_feature(
         ) # return a dict of upstream -> effect
     
     # Now, aggregate the weights across sequence positions and batch elements.
-    shapes = {k : hidden_states_clean[k].act.shape for k in all_submods}
+    shapes = {k : hidden_states_clean[k.name].act.shape for k in all_submods}
 
     rearrange_weights(shapes, edges)
     aggregate_weights(shapes, edges, aggregation)

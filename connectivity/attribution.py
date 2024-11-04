@@ -77,13 +77,10 @@ def get_feature_effect(
                 reconstructed_input += dictionaries[upstream_name].decode(upstream_act.act) + upstream_act.res
             
             if downstream != 'y':
-                # TODO raise NotImplementedError("Check how to deal with inputs for all different modules !")
+                raise NotImplementedError("Check how to deal with inputs for all different modules !")
                 # get the new output of the downstream module.
-                if downstream_submod.LN is not None:
-                    ln = downstream_submod.LN.forward(reconstructed_input)
-                    y = downstream_submod.module.forward(ln)
-                else:
-                    y = downstream_submod.module.forward(reconstructed_input)
+                ln = reconstructed_input if downstream_submod.LN is None else downstream_submod.LN.forward(reconstructed_input)
+                y = downstream_submod.module.forward(ln)
                 
                 y_hat, g = dictionaries[downstream](y, output_features=True)
                 y_res = y - y_hat
