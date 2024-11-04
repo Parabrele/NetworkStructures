@@ -1,6 +1,6 @@
 import torch
 
-from ablation.edge_ablation import run_graph as run_edge_ablation
+from ablation.edge_ablation import __old_run_graph as run_edge_ablation
 from ablation.node_ablation import run_graph as run_node_ablation
 
 from utils.activation import SparseAct

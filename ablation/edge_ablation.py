@@ -1,8 +1,8 @@
 import torch
 
-from utils.activation import get_hidden_states, SparseAct
+from utils.activation import SparseAct, get_hidden_states, get_is_tuple
 
-def reorder_mask(edges):
+def __old_reorder_mask(edges):
     """
     mask : dict of dict of sparse_coo tensors
     returns a dict of dict of sparse_coo tensors
@@ -24,6 +24,180 @@ def compiled_loop_pot_ali(mask_idx, potentially_alive, up_nz):
 
 @torch.no_grad()
 def run_graph(
+        model, # UnifiedTransformer (from nnsight)
+        computational_graph, # dict of downstream -> upstream -> edge_mask (str -> str -> bool sparse_coo_tensor)
+                             # The computational graph of the model.
+                             # The sink is 'y' and all necessary modules and connections should be included in this graph.
+                             # In this dict, modules are represented by their names (str).
+        name2mod, # dict of str -> Submod
+        dictionaries, # dict of str -> SAE
+                      # The feature dictionaries to use for the interpretation.
+                      # Should be at least one for every module appearing in the architecture graph.
+        clean, # tensor (batch, seq_len) : the input to the model
+        patch, # tensor (batch, seq_len) or None : the counterfactual input to the model to ablate edges
+        metric_fn, # dict of str -> callable : scalar functions to evaluate the model
+        metric_fn_kwargs, # dict
+                          # Additional arguments to pass to the metric function.
+                          # e.g. if the metric function is the logit, one should add the position of the target logit.
+        ablation_fn, # callable : the function used to get the patched states. Applied to the hidden states from the forward pass on the patch input.
+        complement=False, # bool : whether to use the given graph or its complement
+):
+    if complement:
+        # TODO : implement complement
+        raise NotImplementedError("Complement is not implemented yet")
+    
+    ##########
+    # Initialization :
+    # - get all necessary objects, lists and hidden states
+    # - get the order in which to compute the modules
+    ##########
+
+    # create the architectural graph (dict of downstream -> upstream) from the computational graph (dict of downstream -> upstream -> edge_mask)
+    architectural_graph = {}
+    for downstream in computational_graph:
+        architectural_graph[downstream] = list(computational_graph[downstream].keys())
+
+    # gather all modules involved in the computation : start from 'y' and do a reachability search.
+    visited = set()
+    to_visit = ['y']
+    while to_visit:
+        downstream = to_visit.pop()
+        if downstream in visited:
+            continue
+        visited.add(downstream)
+        to_visit += architectural_graph.get(downstream, [])
+        
+    all_submods = list(visited)
+    all_submods.remove('y')
+    all_submods = [name2mod[name] for name in all_submods]
+    
+    # get the shape of the hidden states
+    is_tuple = get_is_tuple(model, all_submods)
+
+    # get hidden states for clean and patch inputs
+    hidden_states_clean = get_hidden_states(
+        model, submods=all_submods, dictionaries=dictionaries, is_tuple=is_tuple, input=clean
+    )
+
+    if patch is None:
+        patch = clean
+
+    hidden_states_patch = get_hidden_states(
+        model, submods=all_submods, dictionaries=dictionaries, is_tuple=is_tuple, input=patch
+    )
+    hidden_states_patch = {k : ablation_fn(v) for k, v in hidden_states_patch.items()}
+
+    # Compute the topological order of the graph to know in which order to compute the modules.
+    # This is done by a simple BFS from 'y'. To remove duplicates, keep the last of them
+    topological_order = []
+    visited = set()
+    to_visit = ['y']
+    while to_visit:
+        downstream = to_visit.pop()
+        topological_order.append(downstream) # append to the end (creates dupplicates) : we want the last one
+        if downstream in visited:
+            continue
+        visited.add(downstream)
+        to_visit += architectural_graph.get(downstream, [])
+    
+    reverse_topological_order = topological_order[::-1] # topological order is from 'y' to 'x', we want the reverse
+    temp = [] # remove duplicates by keeping the first in reverse_topological_order
+    for downstream in reverse_topological_order:
+        if downstream in temp:
+            continue
+        temp.append(downstream)
+    
+    topological_order = temp
+
+    ##########
+    # Forward pass with ablation :
+    # - compute the new hidden states of the model in the correct order.
+    # - Modules without upstreams are left unchanged. They are the "input" modules. It is possible that you don't want to start at
+    #   the embed layer, it means that we start modifying the forward pass only for later layers.
+    # - compute each downstream feature with a forward pass on the masked input.
+    ##########
+
+    hidden_states = {}
+    for downstream in topological_order:
+        if downstream == 'y':
+            continue
+
+        upstreams = architectural_graph.get(downstream, None)
+        if upstreams is None:
+            # This module has no upstream, so it is an input module.
+            hidden_states[downstream] = hidden_states_clean[downstream]
+            continue
+
+        # get the hidden states of the upstream modules
+        # TODO : raise NotImplementedError : deal with all possible cases of inputs : if name2mod[upstream].LN is not None, type of upstream, ...
+
+        f = hidden_states_patch[downstream].act
+        potentially_alive = torch.zeros(f.shape[-1] + 1, device=f.device, dtype=torch.bool)
+
+        for upstream in architectural_graph[downstream]:
+            mask = computational_graph[downstream][upstream] # shape (f_down + 1, f_up + 1)
+            up_state = hidden_states[upstream].act # shape (batch, seq_len, f_up)
+            # reduce to (f_up,) by maxing over batch and seq_len (should only have positive entries, but a .abs() can't hurt)
+            up_state = up_state.abs().amax(dim=(0, 1)) # shape (f_up)
+            up_nz = torch.cat([up_state > 0, torch.tensor([True], device=f.device)]) # shape (f_up + 1). Always keep the res feature alive
+            
+            # print("Number of potentially alive features upstream : ", up_nz.sum().item())
+            compiled_loop_pot_ali(mask.indices(), potentially_alive, up_nz)
+        
+        potentially_alive = potentially_alive.nonzero().squeeze(1)
+
+        # f is currently filled with baseline states.
+        # Fill in the potentially alive features with new values.
+        for f_ in potentially_alive:
+            # Recreate the input to the downstream module by keepeing only those relevant for the current feature f_.
+            reconstructed_input = 0
+            for upstream in upstreams:
+                up_clean = hidden_states[upstream]
+                up_patch = hidden_states_patch[upstream]
+                mask = computational_graph[downstream][upstream][f_].to_dense() # shape (f_up + 1)
+
+                up_masked = SparseAct(
+                    act = up_patch.act,# * (1 - mask[:-1]) + up_clean.act * mask[:-1], # TODO : test this
+                    res = up_clean.res if mask[-1] else up_patch.res
+                )
+                up_masked.act[:, :, mask[:-1]] = up_clean.act[:, :, mask[:-1]]
+        
+                reconstructed_input += dictionaries[upstream].decode(up_masked.act) + up_masked.res
+
+            down_mod = name2mod[downstream]
+
+            ln = down_mod.LN.forward(reconstructed_input) if down_mod.LN is not None else reconstructed_input
+            y = down_mod.module.forward(ln)
+            
+            if f_ < f.shape[-1]:
+                f[..., f_] = dictionaries[downstream].encode(y)[..., f_]
+            else:
+                res = y - dictionaries[downstream](y)
+
+        hidden_states[downstream] = SparseAct(act=f, res=res)
+                
+    ##########
+    # Compute the final metrics :
+    ##########
+    with model.trace(clean):
+        patch = dictionaries['y'].decode(hidden_states['y'].act) + hidden_states['y'].res
+        if is_tuple['y']:
+            name2mod['y'].output[0][:] = patch
+        else:
+            name2mod['y'].output = patch
+        
+        if isinstance(metric_fn, dict):
+            metric = {}
+            for name, fn in metric_fn.items():
+                met = fn(model, metric_fn_kwargs).save()
+                metric[name] = met
+        else:
+            raise ValueError("metric_fn must be a dict of functions")
+        
+    return metric
+
+@torch.no_grad()
+def __old_run_graph(
         model,
         submodules,
         dictionaries,
@@ -68,7 +242,7 @@ def run_graph(
     # various initializations
     if isinstance(mask, tuple):
         mask = mask[1]
-    graph = reorder_mask(mask)
+    graph = ... # reorder_mask(mask)
 
     if complement:
         raise NotImplementedError("Complement is not implemented yet")
@@ -147,7 +321,7 @@ def run_graph(
             up_nz = torch.cat([upstream_hidden > 0, torch.tensor([True], device=f.device)]) # shape (f_up + 1). Always keep the res feature alive
             
             # print("Number of potentially alive features upstream : ", up_nz.sum().item())
-            compiled_loop_pot_ali(mask.indices(), potentially_alive, up_nz)
+            ... # compiled_loop_pot_ali(mask.indices(), potentially_alive, up_nz)
 
         potentially_alive = potentially_alive.nonzero().squeeze(1)
         # print("Number of potentially alive features downstream : ", potentially_alive.size(0))
