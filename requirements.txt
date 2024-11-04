@@ -1,0 +1,14 @@
+Graph Tool :
+    conda config --add channels conda-forge
+    conda install graph-tool
+
+conda install pytorch torchvision torchaudio cpuonly -c pytorch
+pip install nnsight
+pip install datasets
+pip install fancy-einsum
+pip install welford-torch
+pip install torchtyping
+pip install networkit
+pip install plotly
+pip install graphviz
+pip install transformer-lens

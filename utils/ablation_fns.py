@@ -1,6 +1,3 @@
-import torch
-from utils.activation import SparseAct
-
 zero_ablation = lambda x: x.zeros_like()
 
 mean_ablation = lambda x: x.mean(dim=(0, 1)).expand_as(x)

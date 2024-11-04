@@ -3,6 +3,7 @@ import random
 import torch as t
 import torch.nn.functional as F
 
+# TODO : Support LN pre and post !
 class Submod:
     """
     A Submod is a helper class which contains a submodule of a model, along with an optional LayerNorm module

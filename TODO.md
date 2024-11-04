@@ -1,5 +1,9 @@
 ## URGENT :
 - Look into pre/post ln : e.g. gemma seems to use ln(module(ln(resid))). More generally consider that SAEs might be attached to different points.
+    - When loading Gemma SAEs, do E <- E * O^-1 and D <- D * O
+        - What about when O is not invertible ?
+            - Alors un sous espace de l'espace avant O est inutile et peut être supprimé. Comment le faire proprement ? C'est encore un truc que les entraineurs de SAE doivent faire et pas moi...
+    - Put LN pre and post in Submod
 
 ## ROIs :
 - find and save the ROIs for any dictionary
