@@ -1,10 +1,13 @@
 import gc
 
 import torch as t
+from tqdm import tqdm
 
-from connectivity.attribution import y_effect, __old_get_effect, get_feature_effect
-from utils.activation import get_is_tuple, get_hidden_states
-from utils.sparse_coo_helper import rearrange_weights, aggregate_weights
+from connectivity.attribution import y_effect, __old_get_effect, get_edge_attr_feature
+from utils.activation import get_is_tuple, get_hidden_states, get_hidden_attr
+from utils.sparse_coo_helper import rearrange_weights, aggregate_weights, aggregate_nodes
+from utils.graph_utils import topological_sort
+from utils.ablation_fns import id_ablation
 
 def get_circuit(
     clean,
@@ -178,21 +181,16 @@ def get_circuit_feature(
         metric_kwargs=dict(), # dict
                               # Additional arguments to pass to the metric function.
                               # e.g. if the metric function is the logit, one should add the position of the target logit.
-        ablation_fn=None, # callable
+        ablation_fn=id_ablation, # callable
                           # Ablation function used for integrated gradient. Applied to the patched hidden states.
                           # The results gives the baseline for the integrated gradients.
         aggregation='sum', # str
                            # Method to aggregate the edge weights across sequence positions and batch elements.
-                           # Supported methods are 'sum' and 'max'. 
-        node_threshold=0.1, # float. Threshold for node pruning.
-                            # When a node's importance is below this threshold, it is not even considered for
-                            # the backward computation of the effects.
-                            # Trade-off between speed and accuracy.
-        edge_threshold=0.01, # float. Threshold for edge pruning.
+                           # Supported methods are 'sum' and 'max'.
+        threshold=0.01, # float. Threshold for edge pruning.
                              # When all edges leaving a node have a weight below this threshold, the node is pruned
                              # and the result is equivalent to the node being below the 'node_threshold'.
-        nodes_only=False, # bool. Whether to return only the nodes using node_threshold and not computing any
-                          # dependency between them. The resulting 'graph' is complete between the remaining nodes.
+        edge_circuit=True, # bool. Whether to compute edge attribution or node attribution.
         steps=10, # int. Number of steps for the integrated gradients.
                   # When this value equals 1, only one gradient step is computed and the method is equivalent to
                   # the Attribution Patching's paper method.
@@ -231,41 +229,58 @@ def get_circuit_feature(
     )
     hidden_states_patch = {k : ablation_fn(v) for k, v in hidden_states_patch.items()}
 
-    features_by_submod = {'y' : [0]}
+    if edge_circuit:
+        # Do edge attribution. Go through features of interest in reverse topological order
+        # to know which of their ancestors contribute and how much.
+        features_by_submod = {'y' : [0]}
+        
+        # Backward through the graph to get effects of upstream modules on downstream modules. Start from 'y'.
+        topological_order = topological_sort(architectural_graph)
+
+        edges = {}
+        for downstream in tqdm(topological_order[::-1]):
+            upstreams = architectural_graph[downstream]
+            if upstreams == [] or upstreams is None:
+                continue
+
+            edges[downstream] = get_edge_attr_feature(
+                model,
+                clean, hidden_states_clean, hidden_states_patch,
+                dictionaries,
+                downstream,
+                architectural_graph[downstream],
+                name2mod,
+                features_by_submod,
+                is_tuple, steps,
+                threshold,
+                metric_fn, metric_kwargs=metric_kwargs,
+            ) # return a dict of upstream -> effect
+        
+        # Now, aggregate the weights across sequence positions and batch elements.
+        shapes = {k.name : hidden_states_clean[k.name].act.shape for k in all_submods}
+
+        rearrange_weights(shapes, edges)
+        aggregate_weights(shapes, edges, aggregation)
+
+        return edges
     
-    # Backward through the graph to get effects of upstream modules on downstream modules. Start from 'y'.
-    visited = set()
-    to_visit = ['y']
-    edges = {}
-    while to_visit:
-        downstream = to_visit.pop()
-        if downstream in visited:
-            continue
-        visited.add(downstream)
-        to_visit += architectural_graph[downstream]
-
-        # TODO : for nodes, use direct paths and consider 'y' -> all_upstream for the architecture graph to feed to get effect
-
-        edges[downstream] = get_feature_effect(
+    else:
+        # Do node attribution.
+        nodes = get_hidden_attr(
             model,
-            clean, hidden_states_clean, hidden_states_patch,
+            all_submods,
             dictionaries,
-            downstream,
-            architectural_graph[downstream],
-            name2mod,
-            features_by_submod,
-            is_tuple, steps,
-            edge_threshold,
-            metric_fn, metric_kwargs=metric_kwargs,
-        ) # return a dict of upstream -> effect
-    
-    # Now, aggregate the weights across sequence positions and batch elements.
-    shapes = {k : hidden_states_clean[k.name].act.shape for k in all_submods}
-
-    rearrange_weights(shapes, edges)
-    aggregate_weights(shapes, edges, aggregation)
-
-    return
+            is_tuple,
+            clean,
+            metric_fn,
+            patch,
+            ablation_fn,
+            steps,
+            metric_kwargs,
+        )
+        aggregate_nodes(nodes, aggregation)
+        
+        return nodes
 
 def get_circuit_roi():
     """

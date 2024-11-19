@@ -315,7 +315,8 @@ def get_is_tuple(model, submods):
     is_tuple = {}
     with model.trace("_"), t.no_grad():
         for submodule in submods:
-            is_tuple[submodule.name] = type(submodule.output.shape) == tuple
+            is_tuple[submodule.name] = type(submodule.module.output.shape) == tuple
+    return is_tuple
 
 def get_hidden_states(
     model,
@@ -372,7 +373,7 @@ def get_hidden_attr(
             fs = []
             for step in range(1, steps + 1):
                 alpha = step / steps
-                upstream_act = (1 - alpha) * clean_state + alpha * patch_state
+                upstream_act = alpha * clean_state + (1 - alpha) * patch_state
                 upstream_act.act.retain_grad()
                 upstream_act.res.retain_grad()
                 fs.append(upstream_act)

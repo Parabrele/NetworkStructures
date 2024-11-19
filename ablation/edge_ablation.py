@@ -1,6 +1,7 @@
 import torch
 
 from utils.activation import SparseAct, get_hidden_states, get_is_tuple
+from utils.graph_utils import topological_sort
 
 def __old_reorder_mask(edges):
     """
@@ -72,7 +73,7 @@ def run_graph(
     all_submods = [name2mod[name] for name in all_submods]
     
     # get the shape of the hidden states
-    is_tuple = get_is_tuple(model, all_submods)
+    is_tuple = get_is_tuple(model, all_submods + [name2mod['y']])
 
     # get hidden states for clean and patch inputs
     hidden_states_clean = get_hidden_states(
@@ -88,26 +89,7 @@ def run_graph(
     hidden_states_patch = {k : ablation_fn(v) for k, v in hidden_states_patch.items()}
 
     # Compute the topological order of the graph to know in which order to compute the modules.
-    # This is done by a simple BFS from 'y'. To remove duplicates, keep the last of them
-    topological_order = []
-    visited = set()
-    to_visit = ['y']
-    while to_visit:
-        downstream = to_visit.pop()
-        topological_order.append(downstream) # append to the end (creates dupplicates) : we want the last one
-        if downstream in visited:
-            continue
-        visited.add(downstream)
-        to_visit += architectural_graph.get(downstream, [])
-    
-    reverse_topological_order = topological_order[::-1] # topological order is from 'y' to 'x', we want the reverse
-    temp = [] # remove duplicates by keeping the first in reverse_topological_order
-    for downstream in reverse_topological_order:
-        if downstream in temp:
-            continue
-        temp.append(downstream)
-    
-    topological_order = temp
+    topological_order = topological_sort(architectural_graph)
 
     ##########
     # Forward pass with ablation :
@@ -117,21 +99,38 @@ def run_graph(
     # - compute each downstream feature with a forward pass on the masked input.
     ##########
 
+    def _aux_reconstruct_input(downstream, f_, upstreams):
+        reconstructed_input = 0
+        for upstream in upstreams:
+            up_clean = hidden_states[upstream]
+            up_patch = hidden_states_patch[upstream]
+            mask = computational_graph[downstream][upstream][f_].to_dense() if downstream != 'y' else computational_graph[downstream][upstream].to_dense() # shape (f_up + 1)
+
+            up_masked = SparseAct(
+                act = up_patch.act.clone(),# * (1 - mask[:-1]) + up_clean.act * mask[:-1], # TODO : test this
+                res = up_clean.res.clone() if mask[-1] else up_patch.res.clone()
+            )
+            up_masked.act[:, :, mask[:-1]] = up_clean.act[:, :, mask[:-1]]
+
+            reconstructed_input += dictionaries[upstream].decode(up_masked.act) + up_masked.res
+        return reconstructed_input
+
     hidden_states = {}
     for downstream in topological_order:
-        if downstream == 'y':
-            continue
-
         upstreams = architectural_graph.get(downstream, None)
-        if upstreams is None:
+        if upstreams is None or upstreams == []:
             # This module has no upstream, so it is an input module.
             hidden_states[downstream] = hidden_states_clean[downstream]
             continue
 
         # get the hidden states of the upstream modules
-        # TODO : raise NotImplementedError : deal with all possible cases of inputs : if name2mod[upstream].LN is not None, type of upstream, ...
+        
+        if downstream == 'y':
+            hidden_states['y'] = _aux_reconstruct_input(downstream, 0, upstreams)
+            continue
 
-        f = hidden_states_patch[downstream].act
+        f = hidden_states_patch[downstream].act.clone()
+        res = hidden_states_patch[downstream].res.clone()
         potentially_alive = torch.zeros(f.shape[-1] + 1, device=f.device, dtype=torch.bool)
 
         for upstream in architectural_graph[downstream]:
@@ -146,28 +145,41 @@ def run_graph(
         
         potentially_alive = potentially_alive.nonzero().squeeze(1)
 
+        # used for resid layers. If upstreams include the current layer's attn and mlp, do not do the full forward pass
+        do_the_forward = True
+        for up in upstreams:
+            if up != 'embed' and not downstream == 'y':
+                u_typ, u_l = up.split('_')
+                d_typ, d_l = downstream.split('_')
+                if u_l == d_l:
+                    do_the_forward = False
+                    break
+
         # f is currently filled with baseline states.
         # Fill in the potentially alive features with new values.
         for f_ in potentially_alive:
             # Recreate the input to the downstream module by keepeing only those relevant for the current feature f_.
-            reconstructed_input = 0
-            for upstream in upstreams:
-                up_clean = hidden_states[upstream]
-                up_patch = hidden_states_patch[upstream]
-                mask = computational_graph[downstream][upstream][f_].to_dense() # shape (f_up + 1)
-
-                up_masked = SparseAct(
-                    act = up_patch.act,# * (1 - mask[:-1]) + up_clean.act * mask[:-1], # TODO : test this
-                    res = up_clean.res if mask[-1] else up_patch.res
-                )
-                up_masked.act[:, :, mask[:-1]] = up_clean.act[:, :, mask[:-1]]
-        
-                reconstructed_input += dictionaries[upstream].decode(up_masked.act) + up_masked.res
+            reconstructed_input = _aux_reconstruct_input(downstream, f_, upstreams)
 
             down_mod = name2mod[downstream]
 
             ln = down_mod.LN.forward(reconstructed_input) if down_mod.LN is not None else reconstructed_input
-            y = down_mod.module.forward(ln)
+            if 'attn' in downstream:
+                y = down_mod.module.forward(ln, ln, ln)
+            elif 'mlp' in downstream:
+                y = down_mod.module.forward(ln)
+            elif 'resid' in downstream:
+                # If the current layer has a resid and it's respective attn & mlp, it is just the sum of the previous resid and both of those.
+                # Otherwise, the input has to go through the whole transformer block.
+                # This would be much easier if I could give an identity module to the submod class, but then I could not intervene
+                # in the .output later on. To do that I would have to properly incorporate that identity module inside of the architecture of the
+                # transformer so that nnsight knows how to deal with it.
+                if do_the_forward:
+                    y = down_mod.module.forward(ln)
+                else:
+                    y = ln
+            else:
+                raise ValueError(f"Downstream module {downstream} not recognized")
             
             if f_ < f.shape[-1]:
                 f[..., f_] = dictionaries[downstream].encode(y)[..., f_]
@@ -175,16 +187,13 @@ def run_graph(
                 res = y - dictionaries[downstream](y)
 
         hidden_states[downstream] = SparseAct(act=f, res=res)
-                
+
     ##########
     # Compute the final metrics :
     ##########
     with model.trace(clean):
-        patch = dictionaries['y'].decode(hidden_states['y'].act) + hidden_states['y'].res
-        if is_tuple['y']:
-            name2mod['y'].output[0][:] = patch
-        else:
-            name2mod['y'].output = patch
+        patch = hidden_states['y']
+        name2mod['y'].module.output = patch
         
         if isinstance(metric_fn, dict):
             metric = {}
@@ -192,7 +201,7 @@ def run_graph(
                 met = fn(model, metric_fn_kwargs).save()
                 metric[name] = met
         else:
-            raise ValueError("metric_fn must be a dict of functions")
+            raise ValueError("metric_fn_dict must be a dict of functions")
         
     return metric
 

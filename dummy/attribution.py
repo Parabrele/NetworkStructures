@@ -149,7 +149,7 @@ def _pe_ig(
             fs = []
             for step in range(1, steps+1):
                 alpha = step / steps
-                f = (1 - alpha) * clean_state + alpha * patch_state
+                f = alpha * clean_state + (1 - alpha) * patch_state
                 f.act.retain_grad()
                 f.res.retain_grad()
                 fs.append(f)

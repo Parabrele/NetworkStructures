@@ -115,13 +115,18 @@ def plot_faithfulness(
         showlegend=True,
     )
 
-    if not os.path.exists(save_path):
-        os.makedirs(save_path)
-    fig.write_html(save_path + "faithfulness.html")
-    # also save as png
-    fig.write_image(save_path + "faithfulness.png")
-    # also save as json
-    fig.write_json(save_path + "faithfulness.json")
+    if save_path is None:
+        # show the plot
+        fig.show()
+        
+    else:
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
+        fig.write_html(save_path + "faithfulness.html")
+        # also save as png
+        fig.write_image(save_path + "faithfulness.png")
+        # also save as json
+        fig.write_json(save_path + "faithfulness.json")
 
 DEFAULT_COLOR = {
     "Marks et al. (original node ablation)": "rgb(255, 228, 181)",

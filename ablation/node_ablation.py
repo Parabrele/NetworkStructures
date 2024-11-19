@@ -4,15 +4,16 @@ from nnsight import LanguageModel
 
 from utils.dictionary import AutoEncoder, IdentityDict
 
-from utils.activation import SparseAct
+from utils.activation import SparseAct, get_hidden_states, get_is_tuple
+from utils.graph_utils import topological_sort
 from utils.utils import load_examples
 
 @t.no_grad()
 def run_graph(
         model,
-        submodules,
+        architectural_graph,
+        name2mod,
         dictionaries,
-        mod2name,
         clean,
         patch,
         mask,
@@ -21,32 +22,36 @@ def run_graph(
         ablation_fn,
         complement=False,
     ):
-    if isinstance(mask, tuple):
-        #print("In run graph, mask is a tuple with", mask[0].keys())#, mask[1].keys())
-        graph_nodes = mask[0]
-    else:
-        graph_nodes = mask
-    if patch is None: patch = clean
-    patch_states = {}
+    # gather all modules involved in the computation : start from 'y' and do a reachability search.
+    visited = set()
+    to_visit = ['y']
+    while to_visit:
+        downstream = to_visit.pop()
+        if downstream in visited:
+            continue
+        visited.add(downstream)
+        to_visit += architectural_graph.get(downstream, [])
+        
+    all_submods = list(visited)
+    all_submods.remove('y')
+    all_submods = [name2mod[name] for name in all_submods]
 
-    with model.trace(patch), t.no_grad():
-        for submodule in submodules:
-            dictionary = dictionaries[submodule]
-            x = submodule.output
-            if type(x.shape) == tuple:
-                x = x[0]
-            x_hat, f = dictionary(x, output_features=True)
-            patch_states[submodule] = SparseAct(act=f, res=x - x_hat).save()
-    patch_states = {k : ablation_fn(v.value) for k, v in patch_states.items()}
+    if patch is None: patch = clean
+    is_tuple = get_is_tuple(model, all_submods)
+    patch_states = get_hidden_states(
+        model, submods=all_submods, dictionaries=dictionaries, is_tuple=is_tuple, input=patch
+    )
+    patch_states = {k : ablation_fn(v) for k, v in patch_states.items()}
+
+    topological_order = topological_sort(architectural_graph)
     
     with model.trace(clean), t.no_grad():
-        for submodule in submodules:
-            submod_name = mod2name[submodule]
-            dictionary = dictionaries[submodule]
-            submod_nodes = graph_nodes[submod_name].clone()
-            x = submodule.output
-            is_tuple = type(x.shape) == tuple
-            if is_tuple:
+        for submod in topological_order:
+            if submod == 'y': continue
+            dictionary = dictionaries[submod]
+            submod_nodes = mask[submod].clone()
+            x = name2mod[submod].module.output
+            if is_tuple[submod]:
                 x = x[0]
             f = dictionary.encode(x)
             res = x - dictionary(x)
@@ -55,13 +60,13 @@ def run_graph(
             if complement: submod_nodes = ~submod_nodes
             submod_nodes.resc = submod_nodes.resc.expand(*submod_nodes.resc.shape[:-1], res.shape[-1])
 
-            f[...,~submod_nodes.act] = patch_states[submodule].act[...,~submod_nodes.act]
-            res[...,~submod_nodes.resc] = patch_states[submodule].res[...,~submod_nodes.resc]
+            f[...,~submod_nodes.act] = patch_states[submod].act[...,~submod_nodes.act]
+            res[...,~submod_nodes.resc] = patch_states[submod].res[...,~submod_nodes.resc]
             
-            if is_tuple:
-                submodule.output[0][:] = dictionary.decode(f) + res
+            if is_tuple[submod]:
+                name2mod[submod].module.output[0][:] = dictionary.decode(f) + res
             else:
-                submodule.output = dictionary.decode(f) + res
+                name2mod[submod].module.output = dictionary.decode(f) + res
 
         if isinstance(metric_fn, dict):
             metric = {}
@@ -71,9 +76,6 @@ def run_graph(
         else:
             raise ValueError("metric_fn must be a dict of functions")
 
-    # # remove absurd values first (inf, nan)
-    # for name, value in metric.items():
-    #     value[~t.isfinite(value)] = 0
     return metric
 
 """

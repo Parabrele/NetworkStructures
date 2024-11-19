@@ -1,5 +1,5 @@
 from collections import namedtuple
-import torch as t
+import torch
 from fancy_einsum import einsum
 import einops
 from tqdm import tqdm
@@ -14,8 +14,7 @@ if DEBUGGING:
 else:
     tracer_kwargs = {'validate' : False, 'scan' : False}
 
-@t.no_grad()
-def get_feature_effect(
+def get_edge_attr_feature(
     model,
     clean, hidden_states_clean, hidden_states_patch,
     dictionaries,
@@ -28,7 +27,8 @@ def get_feature_effect(
     metric_fn, metric_kwargs=dict(),
 ):
     """
-    Get the effect of some upstream module on some downstream module. Uses integrated gradient attribution.
+    Get the effect of some upstream modules on some downstream module. Uses integrated gradient attribution.
+    Do not support feature partitions (ROIs). See get_edge_attr_roi for that.
     """
     try:
         downstream_features = features_by_submod[downstream]
@@ -48,11 +48,19 @@ def get_feature_effect(
         raise ValueError(f"Module {downstream} has no features to compute effects for")
     
     downstream_submod = name2mod[downstream]
+
+    # used for resid layers. If upstreams include the current layer's attn and mlp, do not do the full forward pass
+    do_the_forward = True
+    for up in upstreams:
+        if up != 'embed' and not downstream == 'y':
+            u_typ, u_l = up.split('_')
+            d_typ, d_l = downstream.split('_')
+            if u_l == d_l:
+                do_the_forward = False
+                break
     
     effect_indices = {}
     effect_values = {}
-    clean_states = [hidden_states_clean[upstream_submod] for upstream_submod in upstreams]
-    patch_states = [hidden_states_patch[upstream_submod] for upstream_submod in upstreams]
 
     effect_indices = {}
     effect_values = {}
@@ -66,9 +74,11 @@ def get_feature_effect(
             reconstructed_input = 0
 
             for upstream_name in upstreams:
-                upstream_act = (1 - alpha) * clean_states[upstream_name] + alpha * patch_states[upstream_name] # act shape (batch_size, seq_len, n_features) res shape (batch_size, seq_len, d_model)
-                upstream_act.act = upstream_act.act.clone().detach().requires_grad_(True).retain_grad()
-                upstream_act.res = upstream_act.res.clone().detach().requires_grad_(True).retain_grad()
+                upstream_act = alpha * hidden_states_clean[upstream_name] + (1-alpha) * hidden_states_patch[upstream_name] # act shape (batch_size, seq_len, n_features) res shape (batch_size, seq_len, d_model)
+                upstream_act.act = upstream_act.act.clone().detach()
+                upstream_act.act.requires_grad_().retain_grad()
+                upstream_act.res = upstream_act.res.clone().detach()
+                upstream_act.res.requires_grad_().retain_grad()
 
                 if fs.get(upstream_name) is None:
                     fs[upstream_name] = []
@@ -77,10 +87,24 @@ def get_feature_effect(
                 reconstructed_input += dictionaries[upstream_name].decode(upstream_act.act) + upstream_act.res
             
             if downstream != 'y':
-                raise NotImplementedError("Check how to deal with inputs for all different modules !")
                 # get the new output of the downstream module.
                 ln = reconstructed_input if downstream_submod.LN is None else downstream_submod.LN.forward(reconstructed_input)
-                y = downstream_submod.module.forward(ln)
+                if 'attn' in downstream:
+                    y = downstream_submod.module.forward(ln, ln, ln)
+                elif 'mlp' in downstream:
+                    y = downstream_submod.module.forward(ln)
+                elif 'resid' in downstream:
+                    # If the current layer has a resid and it's respective attn & mlp, it is just the sum of the previous resid and both of those.
+                    # Otherwise, the input has to go through the whole transformer block.
+                    # This would be much easier if I could give an identity module to the submod class, but then I could not intervene
+                    # in the .output later on. To do that I would have to properly incorporate that identity module inside of the architecture of the
+                    # transformer so that nnsight knows how to deal with it.
+                    if do_the_forward:
+                        y = downstream_submod.module.forward(ln)
+                    else:
+                        y = ln
+                else:
+                    raise ValueError(f"Downstream module {downstream} not recognized")
                 
                 y_hat, g = dictionaries[downstream](y, output_features=True)
                 y_res = y - y_hat
@@ -90,31 +114,29 @@ def get_feature_effect(
                 )
                 
                 # Now, modify current feature in the downstream module's output and compute the effect on the metric
-                if downstream_feat == downstream_act.act.size(-1):
-                    diff = downstream_act.res - clean_states[downstream_submod].res
+                # downstream_feat is the flattened index across sequence and features. Extract the feature index and the sequence index :
+                feat_idx = downstream_feat % (downstream_act.act.size(-1) + 1)
+                seq_idx = downstream_feat // (downstream_act.act.size(-1) + 1)
+                if feat_idx == downstream_act.act.size(-1):
+                    diff = downstream_act.res[..., seq_idx, :] - hidden_states_clean[downstream].res[..., seq_idx, :]
                 else:
                     # Get the scalar value (coeff) of the downstream feature
-                    diff = downstream_act.act[..., downstream_feat] - clean_states[downstream_submod].act[..., downstream_feat]
+                    diff = downstream_act.act[..., seq_idx, feat_idx] - hidden_states_clean[downstream].act[..., seq_idx, feat_idx]
                     # Use this to scale the target feature vector
-                    diff = diff * dictionaries[downstream].decoder.weight[:, downstream_feat]
+                    diff = diff * dictionaries[downstream].decoder.weight[:, feat_idx]
             
                 with model.trace(clean, **tracer_kwargs):
                     if is_tuple[downstream]:
-                        downstream_submod.output[0] += diff # downstream_act - clean_states Remove the current feature's effect and add it's patched effect
+                        downstream_submod.module.output[0][..., seq_idx, :] += diff # downstream_act - clean_states Remove the current feature's effect and add it's patched effect
                     else:
-                        downstream_submod.output += diff
+                        downstream_submod.module.output[..., seq_idx, :] += diff
 
-                    metrics.append(metric_fn(model, metric_kwargs))
+                    metrics.append(metric_fn(model, metric_kwargs).save())
             
             else:
                 with model.trace(clean, **tracer_kwargs):
-                    if is_tuple[downstream]:
-                        downstream_submod.output[0] = reconstructed_input
-                    else:
-                        downstream_submod.output = reconstructed_input
-
-                    metrics.append(metric_fn(model, metric_kwargs))
-
+                    downstream_submod.module.output = reconstructed_input
+                    metrics.append(metric_fn(model, metric_kwargs).save())
 
         metric = sum([m for m in metrics])
         metric.sum().backward(retain_graph=True)
@@ -124,42 +146,42 @@ def get_feature_effect(
             mean_res_grad = sum([f.res.grad for f in fs[upstream_name]]) / steps
 
             grad = SparseAct(act=mean_act_grad, res=mean_res_grad)
-            delta = (patch_states[upstream_name] - clean_states[upstream_name]).detach()
+            delta = (hidden_states_patch[upstream_name] - hidden_states_clean[upstream_name]).detach()
 
             if effect_indices.get(upstream_name) is None:
                 effect_indices[upstream_name] = {}
                 effect_values[upstream_name] = {}
 
-            effect = (grad @ delta).abs()
+            effect = (grad @ delta).abs().to_tensor().flatten()
 
-            effect_indices[upstream_name][downstream_feat] = t.where(
+            effect_indices[upstream_name][downstream_feat] = torch.where(
                 effect.abs() > edge_threshold,
                 effect,
-                t.zeros_like(effect)
+                torch.zeros_like(effect)
             ).nonzero().squeeze(-1)
 
             effect_values[upstream_name][downstream_feat] = effect[effect_indices[upstream_name][downstream_feat]]
 
     # get shapes for the return sparse tensors
-    d_downstream_contracted = t.tensor(hidden_states_clean[downstream].act.size() if downstream != 'y' else (0,)) # if downstream == 'y', then the output is a single scalar
+    d_downstream_contracted = torch.tensor(hidden_states_clean[downstream].act.size() if downstream != 'y' else (0,)) # if downstream == 'y', then the output is a single scalar
     d_downstream_contracted[-1] += 1
     d_downstream_contracted = d_downstream_contracted.prod()
 
     d_upstream_contracted = {}
     for upstream_name in upstreams:
-        d_upstream_contracted[upstream_name] = t.tensor(clean_states[upstream_name].act.size())
+        d_upstream_contracted[upstream_name] = torch.tensor(hidden_states_clean[upstream_name].act.size())
         d_upstream_contracted[upstream_name][-1] += 1
-        d_upstream_contracted[upstream_name] = d_upstream_contracted[upstream_name].prod
+        d_upstream_contracted[upstream_name] = d_upstream_contracted[upstream_name].prod()
 
     # Create the sparse_coo_tensor containing the effect of each upstream module on the downstream module
     effects = {}
     for upstream_name in upstreams:
         # converts the dictionary of indices to a tensor of indices
-        effect_indices[upstream_name] = t.tensor(
+        effect_indices[upstream_name] = torch.tensor(
             [[downstream_feat for downstream_feat in downstream_features for _ in effect_indices[upstream_name][downstream_feat]],
-            t.cat([effect_indices[upstream_name][downstream_feat] for downstream_feat in downstream_features], dim=0)]
+            torch.cat([effect_indices[upstream_name][downstream_feat] for downstream_feat in downstream_features], dim=0)]
         ).to(device).long()
-        effect_values[upstream_name] = t.cat([effect_values[upstream_name][downstream_feat] for downstream_feat in downstream_features], dim=0)
+        effect_values[upstream_name] = torch.cat([effect_values[upstream_name][downstream_feat] for downstream_feat in downstream_features], dim=0)
 
         potential_upstream_features = effect_indices[upstream_name][1] # list of indices
         
@@ -171,7 +193,7 @@ def get_feature_effect(
             features_by_submod[upstream_name] += potential_upstream_features.unique().tolist()
             features_by_submod[upstream_name] = list(set(features_by_submod[upstream_name]))
 
-        effects[upstream_name] = t.sparse_coo_tensor(
+        effects[upstream_name] = torch.sparse_coo_tensor(
             effect_indices[upstream_name], effect_values[upstream_name],
             (d_downstream_contracted, d_upstream_contracted[upstream_name])
         )
@@ -215,7 +237,7 @@ def y_effect(
             fs = []
             for step in range(1, steps+1):
                 alpha = step / steps
-                upstream_act = (1 - alpha) * clean_state + alpha * patch_state
+                upstream_act = alpha * clean_state + (1 - alpha) * patch_state
                 upstream_act.act.retain_grad()
                 upstream_act.res.retain_grad()
                 fs.append(upstream_act)
@@ -243,25 +265,25 @@ def y_effect(
                 tot_eff = effect.sum()
                 effect = effect / tot_eff
 
-                perm = t.argsort(effect, descending=True)
-                perm_inv = t.argsort(perm)
+                perm = torch.argsort(effect, descending=True)
+                perm_inv = torch.argsort(perm)
 
-                cumsum = t.cumsum(effect[perm], dim=0)
+                cumsum = torch.cumsum(effect[perm], dim=0)
                 mask = cumsum < edge_threshold
-                first_zero_idx = t.where(mask == 0)[0][0]
+                first_zero_idx = torch.where(mask == 0)[0][0]
                 mask[first_zero_idx] = 1
                 mask = mask[perm_inv]
 
-                effect = t.where(
+                effect = torch.where(
                     mask,
                     effect,
-                    t.zeros_like(effect)
+                    torch.zeros_like(effect)
                 ).to_sparse()
             else:
-                effect = t.where(
+                effect = torch.where(
                         effect.abs() > max(edge_threshold, node_threshold),
                         effect,
-                        t.zeros_like(effect)
+                        torch.zeros_like(effect)
                     ).to_sparse()
                 
             last_effect = effect
@@ -269,7 +291,7 @@ def y_effect(
 
     return last_effect, node_effects
 
-@t.no_grad()
+@torch.no_grad()
 def __old_get_effect(
     model,
     clean,
@@ -324,7 +346,7 @@ def __old_get_effect(
 
         for step in range(1, steps+1):
             alpha = step / steps
-            upstream_act = (1 - alpha) * clean_state + alpha * patch_state # act shape (batch_size, seq_len, n_features) res shape (batch_size, seq_len, d_model)
+            upstream_act = alpha * clean_state + (1 - alpha) * patch_state # act shape (batch_size, seq_len, n_features) res shape (batch_size, seq_len, d_model)
 
             n_features = upstream_act.act.size(-1)
             
@@ -348,7 +370,7 @@ def __old_get_effect(
                     # /!\ do the .to_tensor().flatten() outside of the with in order for the proxies to be populated and .to_tensor() to not crash
                     downstream_act = SparseAct(
                         act=g,
-                        resc=t.norm(y_res, dim=-1)
+                        resc=torch.norm(y_res, dim=-1)
                     ).save()
                 
                 downstream_act = downstream_act.to_tensor().flatten()
@@ -356,14 +378,14 @@ def __old_get_effect(
                 return downstream_act
             
             # Jack shape : outshape x inshape = (# downstream features, batch_size, seq_len, n_features)
-            Jack = t.autograd.functional.jacobian(__jacobian_forward, t.cat([upstream_act.act, upstream_act.res], dim=-1)) + Jack
+            Jack = torch.autograd.functional.jacobian(__jacobian_forward, torch.cat([upstream_act.act, upstream_act.res], dim=-1)) + Jack
 
         # get shapes
-        d_downstream_contracted = t.tensor(hidden_states_clean[downstream_submod].act.size())
+        d_downstream_contracted = torch.tensor(hidden_states_clean[downstream_submod].act.size())
         d_downstream_contracted[-1] += 1
         d_downstream_contracted = d_downstream_contracted.prod()
         
-        d_upstream_contracted = t.tensor(upstream_act.act.size())
+        d_upstream_contracted = torch.tensor(upstream_act.act.size())
         d_upstream_contracted[-1] += 1
         d_upstream_contracted = d_upstream_contracted.prod()
 
@@ -394,30 +416,30 @@ def __old_get_effect(
                 tot_eff = effect_values[downstream_feat].sum()
                 effect_values[downstream_feat] = effect_values[downstream_feat] / tot_eff
 
-                perm = t.argsort(effect_values[downstream_feat], descending=True)
-                cumsum = t.cumsum(effect_values[downstream_feat][perm], dim=0) # start at 0, end at 1
+                perm = torch.argsort(effect_values[downstream_feat], descending=True)
+                cumsum = torch.cumsum(effect_values[downstream_feat][perm], dim=0) # start at 0, end at 1
 
                 mask = cumsum < edge_threshold # only ones then only zeros
-                first_zero_idx = t.where(mask == 0)[0][0]
+                first_zero_idx = torch.where(mask == 0)[0][0]
                 mask[first_zero_idx] = 1
                 effect_indices[downstream_feat] = effect_indices[downstream_feat][perm][mask]
                 effect_values[downstream_feat] = effect_values[downstream_feat][perm][mask]
 
             else :
-                effect_indices[downstream_feat] = t.where(
+                effect_indices[downstream_feat] = torch.where(
                     effect.abs() > edge_threshold,
                     effect,
-                    t.zeros_like(effect)
+                    torch.zeros_like(effect)
                 ).nonzero().squeeze(-1)
 
                 effect_values[downstream_feat] = effect[effect_indices[downstream_feat]]
 
         # converts the dictionary of indices to a tensor of indices
-        effect_indices = t.tensor(
+        effect_indices = torch.tensor(
             [[downstream_feat for downstream_feat in downstream_features for _ in effect_indices[downstream_feat]],
-            t.cat([effect_indices[downstream_feat] for downstream_feat in downstream_features], dim=0)]
+            torch.cat([effect_indices[downstream_feat] for downstream_feat in downstream_features], dim=0)]
         ).to(device).long()
-        effect_values = t.cat([effect_values[downstream_feat] for downstream_feat in downstream_features], dim=0)
+        effect_values = torch.cat([effect_values[downstream_feat] for downstream_feat in downstream_features], dim=0)
 
         potential_upstream_features = effect_indices[1] # list of indices
         # now, in nodes[upstream_submod], we have the effect of upstream_submod on the final output. Keep only the features that have a total effect above the threshold
@@ -429,7 +451,7 @@ def __old_get_effect(
 
         #print(f"Done computing effects for layer {layer}, found {len(effect_values)} edges & {len(features_by_submod[upstream_submod])} features")
         
-        return t.sparse_coo_tensor(
+        return torch.sparse_coo_tensor(
             effect_indices, effect_values,
             (d_downstream_contracted, d_upstream_contracted)
         )
@@ -444,7 +466,7 @@ def head_attribution(
     metric_fn,
     steps=10,
     metric_kwargs=dict(),
-    ablation_fn=lambda x : t.zeros_like(x) if isinstance(x, t.Tensor) else x.zeros_like(),
+    ablation_fn=lambda x : torch.zeros_like(x) if isinstance(x, torch.Tensor) else x.zeros_like(),
 ):
     submodules = attns + other_submods
     
@@ -471,7 +493,7 @@ def head_attribution(
             hidden_states[submodule] = SparseAct(act=f.save(), res=residual.save())
 
     hidden_states_clean = {}
-    with model.trace(clean, **tracer_kwargs), t.no_grad():
+    with model.trace(clean, **tracer_kwargs), torch.no_grad():
         _get_hidden_states(hidden_states_clean)
     hidden_states_clean = {k : v.value for k, v in hidden_states_clean.items()}
 
@@ -479,7 +501,7 @@ def head_attribution(
         patch = clean
 
     hidden_states_patch = {}
-    with model.trace(patch, **tracer_kwargs), t.no_grad():
+    with model.trace(patch, **tracer_kwargs), torch.no_grad():
         _get_hidden_states(hidden_states_patch)
     hidden_states_patch = {k : ablation_fn(v.value) for k, v in hidden_states_patch.items()}
 
@@ -509,7 +531,7 @@ def head_attribution(
                 fs = []
                 for step in range(1, steps+1):
                     alpha = step / steps
-                    f_h = (1 - alpha) * clean_state_h + alpha * patch_state_h
+                    f_h = alpha * clean_state_h + (1 - alpha) * patch_state_h
                     f_h.act.retain_grad()
                     f_h.res.retain_grad()
                     fs.append(f_h)
@@ -546,7 +568,7 @@ def head_attribution(
             effect = effect.act.sum(dim=-1) # sum over the d_head dimension
 
             effects[hook_z].append(effect)
-        effects[hook_z] = t.stack(effects[hook_z], dim=-1) # from list of (batch_size, seq_len) to (batch_size, seq_len, n_head)
+        effects[hook_z] = torch.stack(effects[hook_z], dim=-1) # from list of (batch_size, seq_len) to (batch_size, seq_len, n_head)
     
     # Now, the other submodules
     for submodule in other_submods:
@@ -558,7 +580,7 @@ def head_attribution(
             fs = []
             for step in range(1, steps+1):
                 alpha = step / steps
-                f = (1 - alpha) * clean_state + alpha * patch_state
+                f = alpha * clean_state + (1 - alpha) * patch_state
                 f.act.retain_grad()
                 f.res.retain_grad()
                 fs.append(f)
@@ -614,7 +636,7 @@ def _pe_attrib(
             residual = x - x_hat
             hidden_states_clean[submodule] = SparseAct(act=f, res=residual).save()
             grads[submodule] = hidden_states_clean[submodule].grad.save()
-            residual.grad = t.zeros_like(residual)
+            residual.grad = torch.zeros_like(residual)
             x_recon = x_hat + residual
             if is_tuple[submodule]:
                 submodule.output[0][:] = x_recon
@@ -628,12 +650,12 @@ def _pe_attrib(
 
     if patch is None:
         hidden_states_patch = {
-            k : SparseAct(act=t.zeros_like(v.act), res=t.zeros_like(v.res)) for k, v in hidden_states_clean.items()
+            k : SparseAct(act=torch.zeros_like(v.act), res=torch.zeros_like(v.res)) for k, v in hidden_states_clean.items()
         }
         total_effect = None
     else:
         hidden_states_patch = {}
-        with model.trace(patch, **tracer_kwargs), t.inference_mode():
+        with model.trace(patch, **tracer_kwargs), torch.inference_mode():
             for submodule in submodules:
                 dictionary = dictionaries[submodule]
                 x = submodule.output
@@ -668,7 +690,7 @@ def _pe_ig(
         metric_fn,
         steps=10,
         metric_kwargs=dict(),
-        ablation_fn=lambda x : t.zeros_like(x) if isinstance(x, t.Tensor) else x.zeros_like(),
+        ablation_fn=lambda x : torch.zeros_like(x) if isinstance(x, torch.Tensor) else x.zeros_like(),
 ):
     
     # first run through a test input to figure out which hidden states are tuples
@@ -678,7 +700,7 @@ def _pe_ig(
             is_tuple[submodule] = type(submodule.output.shape) == tuple
 
     hidden_states_clean = {}
-    with model.trace(clean, **tracer_kwargs), t.no_grad():
+    with model.trace(clean, **tracer_kwargs), torch.no_grad():
         for submodule in submodules:
             dictionary = dictionaries[submodule]
             x = submodule.output
@@ -695,7 +717,7 @@ def _pe_ig(
         patch=clean
     else:
         hidden_states_patch = {}
-        with model.trace(patch, **tracer_kwargs), t.no_grad():
+        with model.trace(patch, **tracer_kwargs), torch.no_grad():
             for submodule in submodules:
                 dictionary = dictionaries[submodule]
                 x = submodule.output
@@ -721,7 +743,7 @@ def _pe_ig(
             fs = []
             for step in range(1, steps+1):
                 alpha = step / steps
-                f = (1 - alpha) * clean_state + alpha * patch_state
+                f = alpha * clean_state + (1 - alpha) * patch_state
                 f.act.retain_grad()
                 f.res.retain_grad()
                 fs.append(f)
@@ -762,7 +784,7 @@ def _pe_exact(
             is_tuple[submodule] = type(submodule.output.shape) == tuple
 
     hidden_states_clean = {}
-    with model.trace(clean, **tracer_kwargs), t.inference_mode():
+    with model.trace(clean, **tracer_kwargs), torch.inference_mode():
         for submodule in submodules:
             dictionary = dictionaries[submodule]
             x = submodule.output
@@ -777,12 +799,12 @@ def _pe_exact(
 
     if patch is None:
         hidden_states_patch = {
-            k : SparseAct(act=t.zeros_like(v.act), res=t.zeros_like(v.res)) for k, v in hidden_states_clean.items()
+            k : SparseAct(act=torch.zeros_like(v.act), res=torch.zeros_like(v.res)) for k, v in hidden_states_clean.items()
         }
         total_effect = None
     else:
         hidden_states_patch = {}
-        with model.trace(patch, **tracer_kwargs), t.inference_mode():
+        with model.trace(patch, **tracer_kwargs), torch.inference_mode():
             for submodule in submodules:
                 dictionary = dictionaries[submodule]
                 x = submodule.output
@@ -802,12 +824,12 @@ def _pe_exact(
         dictionary = dictionaries[submodule]
         clean_state = hidden_states_clean[submodule]
         patch_state = hidden_states_patch[submodule]
-        effect = SparseAct(act=t.zeros_like(clean_state.act), resc=t.zeros(*clean_state.res.shape[:-1]))
+        effect = SparseAct(act=torch.zeros_like(clean_state.act), resc=torch.zeros(*clean_state.res.shape[:-1]))
         
         # iterate over positions and features for which clean and patch differ
-        idxs = t.nonzero(patch_state.act - clean_state.act)
+        idxs = torch.nonzero(patch_state.act - clean_state.act)
         for idx in tqdm(idxs):
-            with t.inference_mode():
+            with torch.inference_mode():
                 with model.trace(clean, **tracer_kwargs):
                     f = clean_state.act.clone()
                     f[tuple(idx)] = patch_state.act[tuple(idx)]
@@ -820,7 +842,7 @@ def _pe_exact(
                 effect.act[tuple(idx)] = (metric.value - metric_clean.value).sum()
 
         for idx in list(ndindex(effect.resc.shape)):
-            with t.inference_mode():
+            with torch.inference_mode():
                 with model.trace(clean, **tracer_kwargs):
                     res = clean_state.res.clone()
                     res[tuple(idx)] = patch_state.res[tuple(idx)]
@@ -882,9 +904,9 @@ def jvp(
 
     if not downstream_features: # handle empty list
         if not return_without_right:
-            return t.sparse_coo_tensor(t.zeros((2, 0), dtype=t.long), t.zeros(0)).to(device)
+            return torch.sparse_coo_tensor(torch.zeros((2, 0), dtype=torch.long), torch.zeros(0)).to(device)
         else:
-            return t.sparse_coo_tensor(t.zeros((2, 0), dtype=t.long), t.zeros(0)).to(device), t.sparse_coo_tensor(t.zeros((2, 0), dtype=t.long), t.zeros(0)).to(device)
+            return torch.sparse_coo_tensor(torch.zeros((2, 0), dtype=torch.long), torch.zeros(0)).to(device), torch.sparse_coo_tensor(torch.zeros((2, 0), dtype=torch.long), torch.zeros(0)).to(device)
 
     # first run through a test input to figure out which hidden states are tuples
     is_tuple = {}
@@ -929,7 +951,7 @@ def jvp(
             vjv = (upstream_act.grad @ right_vec).to_tensor().flatten()
             if return_without_right:
                 jv = (upstream_act.grad @ right_vec).to_tensor().flatten()
-            x_res.grad = t.zeros_like(x_res)
+            x_res.grad = torch.zeros_like(x_res)
             to_backprop[downstream_feat].backward(retain_graph=True)
 
             vjv_indices[downstream_feat] = vjv.nonzero().squeeze(-1).save()
@@ -945,22 +967,22 @@ def jvp(
     if return_without_right:
         d_upstream = len(upstream_act.value.to_tensor().flatten())
 
-    vjv_indices = t.tensor(
+    vjv_indices = torch.tensor(
         [[downstream_feat for downstream_feat in downstream_features for _ in vjv_indices[downstream_feat].value],
-         t.cat([vjv_indices[downstream_feat].value for downstream_feat in downstream_features], dim=0)]
+         torch.cat([vjv_indices[downstream_feat].value for downstream_feat in downstream_features], dim=0)]
     ).to(device)
-    vjv_values = t.cat([vjv_values[downstream_feat].value for downstream_feat in downstream_features], dim=0)
+    vjv_values = torch.cat([vjv_values[downstream_feat].value for downstream_feat in downstream_features], dim=0)
 
     if not return_without_right:
-        return t.sparse_coo_tensor(vjv_indices, vjv_values, (d_downstream_contracted, d_upstream_contracted))
+        return torch.sparse_coo_tensor(vjv_indices, vjv_values, (d_downstream_contracted, d_upstream_contracted))
 
-    jv_indices = t.tensor(
+    jv_indices = torch.tensor(
         [[downstream_feat for downstream_feat in downstream_features for _ in jv_indices[downstream_feat].value],
-         t.cat([jv_indices[downstream_feat].value for downstream_feat in downstream_features], dim=0)]
+         torch.cat([jv_indices[downstream_feat].value for downstream_feat in downstream_features], dim=0)]
     ).to(device)
-    jv_values = t.cat([jv_values[downstream_feat].value for downstream_feat in downstream_features], dim=0)
+    jv_values = torch.cat([jv_values[downstream_feat].value for downstream_feat in downstream_features], dim=0)
 
     return (
-        t.sparse_coo_tensor(vjv_indices, vjv_values, (d_downstream_contracted, d_upstream_contracted)),
-        t.sparse_coo_tensor(jv_indices, jv_values, (d_downstream_contracted, d_upstream))
+        torch.sparse_coo_tensor(vjv_indices, vjv_values, (d_downstream_contracted, d_upstream_contracted)),
+        torch.sparse_coo_tensor(jv_indices, jv_values, (d_downstream_contracted, d_upstream))
     )

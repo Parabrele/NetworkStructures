@@ -1,10 +1,10 @@
 import torch
 
-from ablation.edge_ablation import __old_run_graph as run_edge_ablation
+from ablation.edge_ablation import run_graph as run_edge_ablation
 from ablation.node_ablation import run_graph as run_node_ablation
 
 from utils.activation import SparseAct
-from utils.ablation_fns import mean_ablation, zero_ablation
+from utils.ablation_fns import mean_ablation, zero_ablation, id_ablation
 from utils.graph_utils import get_mask, prune, get_n_nodes, get_n_edges, get_density
 
 # TODO : instead of clean and patch, give the buffer, to not re threshold for each batch.
@@ -14,11 +14,11 @@ from utils.graph_utils import get_mask, prune, get_n_nodes, get_n_edges, get_den
 @torch.no_grad()
 def faithfulness(
         model,
-        submodules,
+        name2mod,
         sae_dict,
-        name_dict,
         clean,
         circuit,
+        architectural_graph,
         thresholds,
         metric_fn,
         metric_fn_kwargs={},
@@ -74,6 +74,8 @@ def faithfulness(
             ablation_fn = mean_ablation
         elif default_ablation == 'zero':
             ablation_fn = zero_ablation
+        elif default_ablation == 'id':
+            ablation_fn = id_ablation
         else:
             raise ValueError(f"Unknown default ablation function : {default_ablation}")
     
@@ -83,6 +85,10 @@ def faithfulness(
         run_graph = run_edge_ablation
         
     results = {}
+
+    ##########
+    # Initialisation with useful values
+    ##########
 
     # get unmodified logits
     with model.trace(clean):
@@ -104,48 +110,52 @@ def faithfulness(
     if patch is None: patch = clean
 
     with model.trace(patch):
-        submodule = submodules[-1]
-        x = submodule.output
+        x = name2mod['y'].module.output
         if type(x.shape) == tuple:
             x = x[0]
-        x_hat, f = sae_dict[submodule](x, output_features=True)
+        x_hat, f = sae_dict['y'](x, output_features=True)
         last_state = SparseAct(act=f, res=x - x_hat).save()
     last_state = ablation_fn(last_state)
     with model.trace(patch):
-        submodule = submodules[-1]
-        if isinstance(submodule.output, tuple):
-            submodule.output[0] = sae_dict[submodule].decode(last_state.act) + last_state.res
+        submodule = name2mod['y']
+        if isinstance(submodule.module.output, tuple):
+            submodule.module.output[0] = sae_dict['y'].decode(last_state.act) + last_state.res
         else:
-            submodule.output = sae_dict[submodule].decode(last_state.act) + last_state.res
+            submodule.module.output = sae_dict['y'].decode(last_state.act) + last_state.res
         
         for fn_name, fn in metric_fn.items():
             results['empty'][fn_name] = fn(model, metric_fn_kwargs).save()
+    
+    ##########
+    # Loop over thresholds to run ablation
+    ##########
 
     # get metric on thresholded graph
     for i, threshold in enumerate(thresholds):
         results[threshold] = {}
 
         mask = get_mask(circuit, threshold, threshold_on_nodes=node_ablation)
-        mask = (mask[0], prune(mask[1]))
+        if not node_ablation:
+            mask = prune(mask)
 
         if get_graph_info:
-            results[threshold]['n_nodes'] = get_n_nodes(mask[0] if node_ablation else mask[1])
-            results[threshold]['n_edges'] = get_n_edges((mask[0], mask[1]) if node_ablation else mask[1])
+            results[threshold]['n_nodes'] = get_n_nodes(mask)
+            results[threshold]['n_edges'] = get_n_edges((mask, architectural_graph) if node_ablation else mask)
             results[threshold]['avg_deg'] = 2 * results[threshold]['n_edges'] / (results[threshold]['n_nodes'] if results[threshold]['n_nodes'] > 0 else 1)
-            results[threshold]['density'] = get_density((mask[0], mask[1]) if node_ablation else mask[1])
+            results[threshold]['density'] = get_density((mask, architectural_graph) if node_ablation else mask)
 
         # get dict metric_name -> metric_values
         threshold_result = run_graph(
             model,
-            submodules,
+            architectural_graph if node_ablation else mask,
+            name2mod,
             sae_dict,
-            name_dict,
             clean,
             patch,
-            mask,
-            metric_fn,
-            metric_fn_kwargs,
-            ablation_fn,
+            mask if node_ablation else metric_fn,
+            metric_fn if node_ablation else metric_fn_kwargs,
+            metric_fn_kwargs if node_ablation else ablation_fn,
+            ablation_fn if node_ablation else False,
         )
         results[threshold]['faithfulness'] = {
             k: v.value.mean().item() for k, v in threshold_result.items()

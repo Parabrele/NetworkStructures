@@ -10,18 +10,15 @@ from utils.activation import SparseAct
 # Circuit saving and loading
 ##########
 
-def save_circuit(save_dir, nodes, edges, num_examples, dataset_name=None, model_name=None, node_threshold=None, edge_threshold=None):
+def save_circuit(save_dir, circuit, num_examples, dataset_name=None, model_name=None, threshold=None):
     save_dict = {
-        "nodes" : dict(nodes),
-        "edges" : dict(edges)
+        "circuit" : dict(circuit),
     }
-    node_threshold = str(node_threshold) if node_threshold is not None else 'None'
-    node_threshold = node_threshold.replace('.', '_')
-    edge_threshold = str(edge_threshold) if edge_threshold is not None else 'None'
-    edge_threshold = edge_threshold.replace('.', '_')
+    threshold = str(threshold) if threshold is not None else 'None'
+    threshold = threshold.replace('.', '_')
 
     if dataset_name is not None:
-        save_basename = f"{dataset_name}_{model_name}_node{node_threshold}_edge{edge_threshold}_n{num_examples}"
+        save_basename = f"{dataset_name}_{model_name}_{threshold}_n{num_examples}"
     else:
         save_basename = f"{num_examples}"
 

@@ -5,7 +5,11 @@ from nnsight.models.UnifiedTransformer import UnifiedTransformer
 from utils.utils import Submod
 from utils.dictionary import IdentityDict, LinearDictionary, AutoEncoder
 
-def load_model_and_modules(device, model_name="EleutherAI/pythia-70m-deduped", embed=True, resid=True, attn=True, mlp=True):
+def load_model_and_modules(device, model_name="EleutherAI/pythia-70m-deduped", resid=True, attn=True, mlp=True, start_at_layer=-1):
+    """
+    start_at_layer : int
+        The layer to start loading modules from. If -1, load all layers. If 0, start from 'resid_0'.
+    """
     model = UnifiedTransformer(
         model_name,
         device=device,
@@ -17,15 +21,15 @@ def load_model_and_modules(device, model_name="EleutherAI/pythia-70m-deduped", e
     name2mod = {
         'y' : Submod('y', model.blocks[-1])
     }
-    if embed:
+    if start_at_layer == -1:
         name2mod['embed'] = Submod('embed', model.embed)
     
-    for i in range(len(model.blocks)):
-        if attn:
+    for i in range(max(0, start_at_layer), len(model.blocks)):
+        if attn and start_at_layer < i:
             name2mod[f'attn_{i}'] = Submod(f'attn_{i}', model.blocks[i].attn, model.blocks[i].ln1)
-        if mlp:
+        if mlp and start_at_layer < i:
             name2mod[f'mlp_{i}'] = Submod(f'mlp_{i}', model.blocks[i].mlp, model.blocks[i].ln2)
-        if resid:
+        if resid or start_at_layer == i:
             name2mod[f'resid_{i}'] = Submod(f'resid_{i}', model.blocks[i])
         
     return model, name2mod
@@ -43,6 +47,7 @@ def get_architectural_graph(model, submods):
         'resid_0' : ['attn_0', 'mlp_0', 'embed'],
         'y' : [f'resid_{len(model.blocks)-1}']
     }
+
     for i in range(1, len(model.blocks)):
         graph[f'attn_{i}'] = [f'resid_{i-1}']
         graph[f'mlp_{i}'] = [f'resid_{i-1}'] if model.blocks[i].cfg.parallel_attn_mlp else [f'resid_{i-1}', f'attn_{i}']
@@ -52,8 +57,10 @@ def get_architectural_graph(model, submods):
     for i in range(len(model.blocks)-1, -1, -1):
         if f'attn_{i}' not in submods:
             graph[f'resid_{i}'].remove(f'attn_{i}')
+            del graph[f'attn_{i}']
         if f'mlp_{i}' not in submods:
             graph[f'resid_{i}'].remove(f'mlp_{i}')
+            del graph[f'mlp_{i}']
         if f'resid_{i}' not in submods:
             r = f'resid_{i}'
             for downstream in graph:
@@ -65,7 +72,9 @@ def get_architectural_graph(model, submods):
     
     if 'embed' not in submods:
         for downstream in graph:
-            graph[downstream].remove('embed')
+            if 'embed' in graph[downstream]:
+                graph[downstream].remove('embed')
+        del graph['embed']
 
     return graph
 
@@ -109,7 +118,6 @@ def load_saes(
         dictionaries['embed'].bias = mean
 
     for layer in range(len(model.gpt_neox.layers if not unified else model.blocks)):
-        
         if not svd:
             ae = AutoEncoder(d_model, dict_size).to(device)
             ae.load_state_dict(torch.load(path + f"resid_out_layer{layer}/ae.pt", map_location=device))
@@ -152,6 +160,7 @@ def load_saes(
             dictionaries[f'mlp_{layer}'].D = V
             dictionaries[f'mlp_{layer}'].bias = mean
     
+    dictionaries['y'] = dictionaries[f'resid_{len(model.gpt_neox.layers if not unified else model.blocks)-1}']
     return dictionaries
 
 # TODO : delete the below functions after testing the new pipeline

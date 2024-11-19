@@ -167,7 +167,7 @@ def rearrange_weights(shapes, edges):
             bu, su, fu = shapes[upstream]
             weight_matrix = edges[downstream][upstream]
             if downstream == 'y':
-                weight_matrix = sparse_reshape(weight_matrix, (bd, sd, fd+1))
+                weight_matrix = sparse_reshape(weight_matrix, (bu, su, fu+1))
             else:
                 assert bd == bu
                 weight_matrix = sparse_reshape(weight_matrix, (bd, sd, fd+1, bu, su, fu+1))
@@ -251,6 +251,26 @@ def __old__aggregate_weights(
         _save_all_batch(nodes, edges, aggregation, base_dir=save_path)
     # aggregate across batch dimension
     _aggregate(w_y_b_fct, w_b_fct, n_b_fct)
+
+def aggregate_nodes(nodes, aggregation='sum'):
+    if aggregation == 'sum':
+        n_s_fct = lambda n: n.sum(dim=1)
+        n_b_fct = lambda n: n.mean(dim=0)
+    elif aggregation == 'max':
+        n_s_fct = lambda n: n.amax(dim=1)
+        n_b_fct = lambda n: n.amax(dim=0)
+    else:
+        raise ValueError(f"Unknown aggregation: {aggregation}")
+
+    def _aggregate(n_fct):
+        for node in nodes:
+            if node != 'y':
+                nodes[node] = n_fct(nodes[node])
+
+    # aggregate across sequence position
+    _aggregate(n_s_fct)
+    # aggregate across batch dimension
+    _aggregate(n_b_fct)
 
 def aggregate_weights(
     shapes, edges, aggregation='sum', dump_all=False, save_path=None

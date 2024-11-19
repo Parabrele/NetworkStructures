@@ -359,6 +359,46 @@ def wikipedia_buffer(
 
     return buffer
 
+class single_input_buffer:
+    def __init__(self, model, batch_size, device, ctx_len=None, perm=None):
+        self.model = model
+        self.batch_size = batch_size
+        self.device = device
+        self.ctx_len = ctx_len
+        self.data = {
+            "clean": ["When Mary and John went to the store, John gave a glass to"],
+            "good": [[" Mary"]],
+            "corr": ["When Mary and John went to the store, Paul gave a glass to"],
+            "bad": [[" John"]],
+        }
+        self.done = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.done:
+            raise StopIteration
+        self.done = True
+        tk = self.model.tokenizer
+        clean_tokens = tk(self.data["clean"], return_tensors='pt', padding=True, return_attention_mask=False, return_token_type_ids=False)['input_ids'].to(self.device)
+        trg_idx = torch.zeros(clean_tokens.size(0), device=clean_tokens.device).long() - 1
+        trg = []
+        for i, good in enumerate(self.data["good"]):
+            trg.append(tk(good, return_tensors='pt', return_attention_mask=False, return_token_type_ids=False)['input_ids'].to(self.device)[:, -1])
+        corr_tokens = tk(self.data["corr"], return_tensors='pt', padding=True, return_attention_mask=False, return_token_type_ids=False)['input_ids'].to(self.device)
+        corr_trg = []
+        for i, bad in enumerate(self.data["bad"]):
+            corr_trg.append(tk(bad, return_tensors='pt', return_attention_mask=False, return_token_type_ids=False)['input_ids'].to(self.device)[:, -1])
+
+        return {
+            "clean": clean_tokens,
+            "trg_idx": trg_idx,
+            "trg": trg,
+            "corr": corr_tokens,
+            "corr_trg": corr_trg,
+        }
+
 if __name__ == "__main__":
     ioi_dataset = load_from_disk(ioi_path)
     print(ioi_dataset)
