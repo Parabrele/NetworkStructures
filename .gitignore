@@ -166,3 +166,5 @@ circuits/*
 nohup.out
 data/datasets/*
 data/runs/*
+*.out
+*.err
