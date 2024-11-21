@@ -43,10 +43,6 @@ def run_graph(
         ablation_fn, # callable : the function used to get the patched states. Applied to the hidden states from the forward pass on the patch input.
         complement=False, # bool : whether to use the given graph or its complement
 ):
-    if complement:
-        # TODO : implement complement
-        raise NotImplementedError("Complement is not implemented yet")
-    
     ##########
     # Initialization :
     # - get all necessary objects, lists and hidden states
@@ -87,6 +83,9 @@ def run_graph(
         model, submods=all_submods, dictionaries=dictionaries, is_tuple=is_tuple, input=patch
     )
     hidden_states_patch = {k : ablation_fn(v) for k, v in hidden_states_patch.items()}
+
+    if complement:
+        hidden_states_clean, hidden_states_patch = hidden_states_patch, hidden_states_clean
 
     # Compute the topological order of the graph to know in which order to compute the modules.
     topological_order = topological_sort(architectural_graph)
@@ -134,11 +133,14 @@ def run_graph(
         potentially_alive = torch.zeros(f.shape[-1] + 1, device=f.device, dtype=torch.bool)
 
         for upstream in architectural_graph[downstream]:
+            # We want to know if inputs to target feature have been modified w.r.t. the baseline input.
+            # This will tell us which target feature we need to recompute separately.
             mask = computational_graph[downstream][upstream] # shape (f_down + 1, f_up + 1)
             up_state = hidden_states[upstream].act # shape (batch, seq_len, f_up)
+            up_state -= hidden_states_patch[upstream].act
             # reduce to (f_up,) by maxing over batch and seq_len (should only have positive entries, but a .abs() can't hurt)
             up_state = up_state.abs().amax(dim=(0, 1)) # shape (f_up)
-            up_nz = torch.cat([up_state > 0, torch.tensor([True], device=f.device)]) # shape (f_up + 1). Always keep the res feature alive
+            up_nz = torch.cat([up_state > 1e-6, torch.tensor([True], device=f.device)]) # shape (f_up + 1). Always keep the res feature alive
             
             # print("Number of potentially alive features upstream : ", up_nz.sum().item())
             compiled_loop_pot_ali(mask.indices(), potentially_alive, up_nz)
@@ -192,16 +194,12 @@ def run_graph(
     # Compute the final metrics :
     ##########
     with model.trace(clean):
-        patch = hidden_states['y']
-        name2mod['y'].module.output = patch
+        name2mod['y'].module.output = hidden_states['y']
         
-        if isinstance(metric_fn, dict):
-            metric = {}
-            for name, fn in metric_fn.items():
-                met = fn(model, metric_fn_kwargs).save()
-                metric[name] = met
-        else:
-            raise ValueError("metric_fn_dict must be a dict of functions")
+        metric = {}
+        for name, fn in metric_fn.items():
+            met = fn(model, metric_fn_kwargs).save()
+            metric[name] = met
         
     return metric
 

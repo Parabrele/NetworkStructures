@@ -21,112 +21,112 @@ def plot_faithfulness(
     TODO : Plot edges w.r.t. nodes, and other plots if needed
     """
 
-    thresholds = []
-    n_nodes = []
-    n_edges = []
-    avg_deg = []
-    density = []
-    # modularity = []
-    # z_score = []
-    faithfulness = {}
-    for t in outs:
-        if t == 'complete':
-            continue
-        if t == 'empty':
-            continue
-        thresholds.append(t)
-        n_nodes.append(outs[t]['n_nodes'])
-        n_edges.append(outs[t]['n_edges'])
-        avg_deg.append(outs[t]['avg_deg'])
-        density.append(outs[t]['density'])
-        # modularity.append(outs[t]['modularity'])
-        # z_score.append(outs[t]['z_score'])
-        for i, fn_name in enumerate(outs[t]['faithfulness']):
-            if i not in faithfulness:
-                faithfulness[i] = []
-            faithfulness[i].append(outs[t]['faithfulness'][fn_name])
+    for faith in ['faithfulness', 'completeness']:
+        thresholds = []
+        n_nodes = []
+        n_edges = []
+        avg_deg = []
+        density = []
+        # modularity = []
+        # z_score = []
+        faithfulness = {}
+        for t in outs:
+            if t == 'complete':
+                continue
+            if t == 'empty':
+                continue
+            thresholds.append(t)
+            n_nodes.append(outs[t]['n_nodes'])
+            n_edges.append(outs[t]['n_edges'])
+            avg_deg.append(outs[t]['avg_deg'])
+            density.append(outs[t]['density'])
+            # modularity.append(outs[t]['modularity'])
+            # z_score.append(outs[t]['z_score'])
+            for i, fn_name in enumerate(outs[t][faith]):
+                if i not in faithfulness:
+                    faithfulness[i] = []
+                faithfulness[i].append(outs[t][faith][fn_name])
 
-    fig = make_subplots(
-        rows=4 + len(list(faithfulness.keys())),
-        cols=1,
-    )
-
-    for i, fn_name in enumerate(outs[thresholds[0]]['faithfulness']):
-        print(fn_name, faithfulness[i])
-        fig.add_trace(go.Scatter(
-                x=thresholds,
-                y=faithfulness[i],
-                mode='lines+markers',
-                #title_text=fn_name+" faithfulness vs threshold",
-                name=fn_name,
-            ),
-            row=i+1, col=1
+        fig = make_subplots(
+            rows=4 + len(list(faithfulness.keys())),
+            cols=1,
         )
 
-    fig.add_trace(
-        go.Scatter(
-            x=thresholds,
-            y=n_nodes,
-            mode='lines+markers',
-            #title_text="n_nodes vs threshold",
-            name='n_nodes',
-        ),
-        row=len(list(faithfulness.keys()))+1, col=1
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=thresholds,
-            y=n_edges,
-            mode='lines+markers',
-            #title_text="n_edges vs threshold",
-            name='n_edges',
-        ),
-        row=len(list(faithfulness.keys()))+2, col=1
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=thresholds,
-            y=avg_deg,
-            mode='lines+markers',
-            #title_text="avg_deg vs threshold",
-            name='avg_deg',
-        ),
-        row=len(list(faithfulness.keys()))+3, col=1
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=thresholds,
-            y=density,
-            mode='lines+markers',
-            #title_text="density vs threshold",
-            name='density',
-        ),
-        row=len(list(faithfulness.keys()))+4, col=1
-    )
+        for i, fn_name in enumerate(outs[thresholds[0]][faith]):
+            fig.add_trace(go.Scatter(
+                    x=thresholds,
+                    y=faithfulness[i],
+                    mode='lines+markers',
+                    #title_text=fn_name+" faithfulness vs threshold",
+                    name=fn_name,
+                ),
+                row=i+1, col=1
+            )
 
-    # Update x-axes to log scale
-    fig.update_xaxes(type="log")
+        fig.add_trace(
+            go.Scatter(
+                x=thresholds,
+                y=n_nodes,
+                mode='lines+markers',
+                #title_text="n_nodes vs threshold",
+                name='n_nodes',
+            ),
+            row=len(list(faithfulness.keys()))+1, col=1
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=thresholds,
+                y=n_edges,
+                mode='lines+markers',
+                #title_text="n_edges vs threshold",
+                name='n_edges',
+            ),
+            row=len(list(faithfulness.keys()))+2, col=1
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=thresholds,
+                y=avg_deg,
+                mode='lines+markers',
+                #title_text="avg_deg vs threshold",
+                name='avg_deg',
+            ),
+            row=len(list(faithfulness.keys()))+3, col=1
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=thresholds,
+                y=density,
+                mode='lines+markers',
+                #title_text="density vs threshold",
+                name='density',
+            ),
+            row=len(list(faithfulness.keys()))+4, col=1
+        )
 
-    # default layout is : height=600, width=800. We want to make it a bit bigger so that each plot has the original size
-    fig.update_layout(
-        height=600 + 400 * (4 + len(list(faithfulness.keys()))),
-        width=800,
-        title_text="Faithfulness and graph properties w.r.t. threshold",
-        showlegend=True,
-    )
+        # Update x-axes to log scale
+        fig.update_xaxes(type="log")
 
-    if save_path is None:
-        # show the plot
-        fig.show()
-        
-    else:
-        if not os.path.exists(save_path):
-            os.makedirs(save_path)
-        fig.write_html(save_path + "faithfulness.html")
-        # also save as png
-        fig.write_image(save_path + "faithfulness.png")
-        # also save as json
-        fig.write_json(save_path + "faithfulness.json")
+        # default layout is : height=600, width=800. We want to make it a bit bigger so that each plot has the original size
+        fig.update_layout(
+            height=600 + 400 * (4 + len(list(faithfulness.keys()))),
+            width=800,
+            title_text=faith+" and graph properties w.r.t. threshold",
+            showlegend=True,
+        )
+
+        if save_path is None:
+            # show the plot
+            fig.show()
+            
+        else:
+            if not os.path.exists(save_path):
+                os.makedirs(save_path)
+            fig.write_html(save_path + faith + ".html")
+            # also save as png
+            fig.write_image(save_path + faith + ".png")
+            # also save as json
+            fig.write_json(save_path + faith + ".json")
 
 DEFAULT_COLOR = {
     "Marks et al. (original node ablation)": "rgb(255, 228, 181)",

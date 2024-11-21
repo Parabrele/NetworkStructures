@@ -1,4 +1,9 @@
-# Run the main experiment : faithfulness of circuits
+# Run the faithfulness of circuits experiments.
+
+###
+# In the correct directory, execute e.g. :
+# python -m experiments.main &
+###
 
 ##########
 # Get arguments from the command line
@@ -13,7 +18,7 @@ parser.add_argument("--dataset", type=str, default="ioi")
 parser.add_argument("--batch_size", type=int, default=1)
 parser.add_argument("--eval_batch_size", type=int, default=100)
 
-parser.add_argument("--edge_circuit", type=bool, default=True)
+parser.add_argument("--node_circuit", action="store_true", default=False)
 parser.add_argument("--threshold", type=float, default=1e-4)
 parser.add_argument("--start_at_layer", type=int, default=2)
 
@@ -60,13 +65,21 @@ import math
 
 save_path = args.save_path
 
-edge_circuit = args.edge_circuit
+edge_circuit = not args.node_circuit
 
 use_attn_mlp = False
 use_resid = True
 start_at_layer = args.start_at_layer
 threshold = args.threshold
 steps = 10
+
+experiment_name = ('resid' if use_resid else '') \
+    + ('_' if use_resid and use_attn_mlp else '') \
+    + ('attn_mlp' if use_attn_mlp else '') \
+    + '/' + ('edge' if edge_circuit else 'node') + '_ablation/'
+
+save_path += args.dataset + '/'
+save_path += experiment_name
 
 batch_size = args.batch_size
 eval_batch_size = args.eval_batch_size
@@ -81,6 +94,8 @@ elif args.dataset == "mixture":
     DATASET = mixture_buffer
     n_elts = 600
     n_tests = 600
+else:
+    raise ValueError(f"Unknown dataset : {args.dataset}")
 
 metric_fn = metric_fn_logit
 metric_fn_dict = {
@@ -140,7 +155,7 @@ def normalize_circuit(circuit, factor):
         circuit = {k : {kk : vv / factor for kk, vv in v.items()} for k, v in circuit.items()}
     return circuit
 
-def get_circuit(circuit_fn, device_id=0, perm=None, circuit_name=None):
+def get_circuit(circuit_fn, device_id=0, perm=None):
     DEVICE = torch.device('cuda:{}'.format(device_id)) if torch.cuda.is_available() else torch.device('cpu')    
 
     # Set up the model and data
@@ -184,14 +199,14 @@ def get_circuit(circuit_fn, device_id=0, perm=None, circuit_name=None):
     tot_circuit = normalize_circuit(tot_circuit, tot_inputs)
 
     save_circuit(
-        save_path+f"circuit/{circuit_name}/{DEVICE.type}_{DEVICE.index}/",
+        save_path+f"circuit/{DEVICE.type}_{DEVICE.index}/",
         tot_circuit,
         0,   
     )
 
     return tot_circuit
 
-def get_faithfulness(circuit, node_ablation):
+def get_faithfulness(circuit):
     """
     Compute the faithfulness of the circuit.
     """
@@ -208,10 +223,10 @@ def get_faithfulness(circuit, node_ablation):
     for batch in tqdm(buffer):
         tokens, trg_idx, trg, corr, corr_trg = unpack_batch(batch)
 
-        n_batches += 1
         tot_inputs += tokens.shape[0]
         if tot_inputs > n_tests:
             break
+        n_batches += 1
         
         thresholds = torch.logspace(math.log10(threshold), 0, nb_eval_thresholds, 10).tolist()
 
@@ -241,6 +256,8 @@ def get_faithfulness(circuit, node_ablation):
             else:
                 for fn_name in out['faithfulness']:                        
                     aggregated_outs[t]['faithfulness'][fn_name] += out['faithfulness'][fn_name]
+                for fn_name in out['completeness']:                        
+                    aggregated_outs[t]['completeness'][fn_name] += out['completeness'][fn_name]
 
         del faithfulness
 
@@ -249,6 +266,8 @@ def get_faithfulness(circuit, node_ablation):
             continue
         for fn_name in out['faithfulness']:
             aggregated_outs[t]['faithfulness'][fn_name] /= n_batches
+        for fn_name in out['completeness']:
+            aggregated_outs[t]['completeness'][fn_name] /= n_batches
 
     return aggregated_outs
 
@@ -259,7 +278,7 @@ if __name__ == "__main__":
 
     print("Getting circuit...")
 
-    if not os.path.exists(save_path+"circuit/our/merged/0.pt"):
+    if not os.path.exists(save_path+"circuit/merged/0.pt"):
         perm = torch.randperm(n_elts)
         available_gpus = torch.cuda.device_count()
         elts_per_gpu = n_elts // available_gpus
@@ -267,27 +286,33 @@ if __name__ == "__main__":
             elts_per_gpu = n_elts
             available_gpus = 1
 
-        futures = []
-        with ProcessPoolExecutor(max_workers=available_gpus) as executor:
-            for i in range(available_gpus):
-                futures.append(executor.submit(get_circuit, get_circuit_feature, i, perm[i*elts_per_gpu:(i+1)*elts_per_gpu], "our"))
+        # futures = []
+        # with ProcessPoolExecutor(max_workers=available_gpus) as executor:
+        #     for i in range(available_gpus):
+        #         futures.append(executor.submit(get_circuit, get_circuit_feature, i, perm[i*elts_per_gpu:(i+1)*elts_per_gpu]))
+
+        # tot_circuit = None
+        # for future in futures:
+        #     circuit = future.result()
+        #     circuit = circuit_to_device(circuit, DEVICE)
+        #     tot_circuit = add_circuit(tot_circuit, circuit)
 
         tot_circuit = None
-        for future in futures:
-            circuit = future.result()
+        for i in range(available_gpus):
+            circuit = torch.load(save_path+f"circuit/cuda_{i}/0.pt")["circuit"]
             circuit = circuit_to_device(circuit, DEVICE)
             tot_circuit = add_circuit(tot_circuit, circuit)
 
         circuit = normalize_circuit(tot_circuit, available_gpus)
 
         save_circuit(
-            save_path+"circuit/our/merged/",
-            tot_circuit,
+            save_path+"circuit/merged/",
+            circuit,
             0,
         )
     else:
         # Load the circuit :
-        circuit_dict = torch.load(save_path+"circuit/our/merged/0.pt")
+        circuit_dict = torch.load(save_path+"circuit/merged/0.pt")
         circuit = circuit_dict["circuit"]
     
     print("Done.")
@@ -297,6 +322,6 @@ if __name__ == "__main__":
     ##########
 
     print("Evaluation")
-    aggregated_outs = get_faithfulness(tot_circuit, node_ablation=True)
-    plot_faithfulness(aggregated_outs, save_path=save_path+'us/' + ('edge_ablation/' if edge_circuit else 'node_ablation/') + '/')
+    aggregated_outs = get_faithfulness(circuit)
+    plot_faithfulness(aggregated_outs, save_path=save_path)
     print("Done.")

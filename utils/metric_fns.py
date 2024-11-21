@@ -36,6 +36,45 @@ def metric_fn_logit(model, kwargs={}):
                 res -= logits[i, tokens].sum()
     return res
 
+def metric_fn_logit_extended(model, kwargs={}):
+    """
+    Same as metric_fn_logit but do not aggregate over the batch dimension
+    """
+    """
+    return the target logit
+    requires trg_idx and at least one of trg_pos or trg_neg
+    """
+    if isinstance(model, UnifiedTransformer):
+        module = model.unembed
+    else:
+        module = model.embed_out
+    trg_idx = kwargs.get('trg_idx', None)
+    trg_pos = kwargs.get('trg_pos', None)
+    trg_neg = kwargs.get('trg_neg', None)
+
+    if trg_pos is None and trg_neg is None:
+        raise ValueError("Wrong arguments in metric_fn_logit")
+
+    b = trg_idx.numel()
+    logits = module.output[torch.arange(b), trg_idx] # (b, s, d_model) -> (b, d_model)
+    res = torch.zeros_like(logits)[:, 0] # (b, d_model) -> (b), just to create a proxy tensor when logits is. If this still creates a tensor, clone logits, multiply by 0 and take the first column
+    if trg_pos is not None:
+        if isinstance(trg_pos, torch.Tensor):
+            raise NotImplementedError("This case is not implemented. Check that trg_pos and logits are as expected")
+            res = logits[torch.arange(b), trg_pos]
+        elif isinstance(trg_pos, list):
+            for i, tokens in enumerate(trg_pos):
+                res[i] = logits[i, tokens].sum()
+    if trg_neg is not None:
+        if isinstance(trg_neg, torch.Tensor):
+            raise NotImplementedError("This case is not implemented. Check that trg_neg and logits are as expected")
+            res -= logits[torch.arange(b), trg_neg]
+        elif isinstance(trg_neg, list):
+            for i, tokens in enumerate(trg_neg):
+                res[i] -= logits[i, tokens].sum()
+    return res
+
+
 def metric_fn_KL(model, kwargs={}):
     """
     return the KL divergence between the current logits and a target clean logits

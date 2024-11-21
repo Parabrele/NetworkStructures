@@ -238,7 +238,7 @@ def get_circuit_feature(
         topological_order = topological_sort(architectural_graph)
 
         edges = {}
-        for downstream in tqdm(topological_order[::-1]):
+        for downstream in topological_order[::-1]:
             upstreams = architectural_graph[downstream]
             if upstreams == [] or upstreams is None:
                 continue
