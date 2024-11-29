@@ -168,12 +168,20 @@ def faithfulness(
             k: v.value.mean().item() for k, v in threshold_result.items()
         }
 
+        # print(f"Threshold {threshold} :")
         for k in threshold_result:
             g = threshold_result[k].value
             m = results['complete'][k].value
             e = results['empty'][k].value
             faith = (g-e)/(m-e)
+            # print(f"\t{k} :")
+            # print(f"\t\tg : {g}")
+            # print(f"\t\tm : {m}")
+            # print(f"\t\te : {e}")
+            # print(f"\t\tfaith : {faith}")
             faith = torch.where((m-e).abs() < 1e-6, torch.zeros_like(faith), faith)
+            # print(f"\t\tfaith post where : {faith}")
+            # print(f"\t\tfaith mean : {faith.mean()}")
             results[threshold]['faithfulness']['faithfulness_' + k] = faith.mean().item()
 
         run_graph_args['complement'] = True

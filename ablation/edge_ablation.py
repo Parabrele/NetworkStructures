@@ -136,8 +136,7 @@ def run_graph(
             # We want to know if inputs to target feature have been modified w.r.t. the baseline input.
             # This will tell us which target feature we need to recompute separately.
             mask = computational_graph[downstream][upstream] # shape (f_down + 1, f_up + 1)
-            up_state = hidden_states[upstream].act # shape (batch, seq_len, f_up)
-            up_state -= hidden_states_patch[upstream].act
+            up_state = hidden_states[upstream].act - hidden_states_patch[upstream].act # shape (batch, seq_len, f_up)
             # reduce to (f_up,) by maxing over batch and seq_len (should only have positive entries, but a .abs() can't hurt)
             up_state = up_state.abs().amax(dim=(0, 1)) # shape (f_up)
             up_nz = torch.cat([up_state > 1e-6, torch.tensor([True], device=f.device)]) # shape (f_up + 1). Always keep the res feature alive

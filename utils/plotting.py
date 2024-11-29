@@ -20,7 +20,10 @@ def plot_faithfulness(
 
     TODO : Plot edges w.r.t. nodes, and other plots if needed
     """
+    # If outs contains scalar values, plot lines.
+    # If outs contains list of scalar values, plot points. #TODO : can I do some sort of average line plot?
 
+    is_list = False
     for faith in ['faithfulness', 'completeness']:
         thresholds = []
         n_nodes = []
@@ -36,6 +39,8 @@ def plot_faithfulness(
             if t == 'empty':
                 continue
             thresholds.append(t)
+            if isinstance(outs[t]['n_nodes'], list):
+                is_list = True
             n_nodes.append(outs[t]['n_nodes'])
             n_edges.append(outs[t]['n_edges'])
             avg_deg.append(outs[t]['avg_deg'])
@@ -46,6 +51,36 @@ def plot_faithfulness(
                 if i not in faithfulness:
                     faithfulness[i] = []
                 faithfulness[i].append(outs[t][faith][fn_name])
+            
+        if is_list:
+            # n_nodes and all are lists of lists : flatten them
+            
+            def gaussian_kernel(data, window_size, sigma=5):
+                kernel = [math.exp(-0.5 * ((x - window_size // 2) / sigma) ** 2) for x in range(window_size)]
+                kernel = [x / sum(kernel) for x in kernel]
+                return [sum(data[i + j] * kernel[j] for j in range(window_size)) for i in range(len(data) - window_size + 1)]
+
+            window_size = 45
+
+            n_nodes = [item for sublist in n_nodes for item in sublist]
+            perm = sorted(range(len(n_nodes)), key=lambda k: n_nodes[k])
+
+            n_nodes = [n_nodes[i] for i in perm]
+            n_nodes = gaussian_kernel(n_nodes, window_size)
+            n_edges = [item for sublist in n_edges for item in sublist]
+            n_edges = [n_edges[i] for i in perm]
+            n_edges = gaussian_kernel(n_edges, window_size)
+            avg_deg = [item for sublist in avg_deg for item in sublist]
+            avg_deg = [avg_deg[i] for i in perm]
+            avg_deg = gaussian_kernel(avg_deg, window_size)
+            density = [item for sublist in density for item in sublist]
+            density = [density[i] for i in perm]
+            density = gaussian_kernel(density, window_size)
+
+            for i in faithfulness:
+                faithfulness[i] = [item for sublist in faithfulness[i] for item in sublist]
+                faithfulness[i] = [faithfulness[i][j] for j in perm]
+                faithfulness[i] = gaussian_kernel(faithfulness[i], window_size)
 
         fig = make_subplots(
             rows=4 + len(list(faithfulness.keys())),
@@ -54,9 +89,9 @@ def plot_faithfulness(
 
         for i, fn_name in enumerate(outs[thresholds[0]][faith]):
             fig.add_trace(go.Scatter(
-                    x=thresholds,
+                    x=n_nodes,
                     y=faithfulness[i],
-                    mode='lines+markers',
+                    mode='lines' if is_list else 'lines+markers',
                     #title_text=fn_name+" faithfulness vs threshold",
                     name=fn_name,
                 ),
@@ -65,9 +100,9 @@ def plot_faithfulness(
 
         fig.add_trace(
             go.Scatter(
-                x=thresholds,
+                x=n_nodes,
                 y=n_nodes,
-                mode='lines+markers',
+                mode='lines' if is_list else 'lines+markers',
                 #title_text="n_nodes vs threshold",
                 name='n_nodes',
             ),
@@ -75,9 +110,9 @@ def plot_faithfulness(
         )
         fig.add_trace(
             go.Scatter(
-                x=thresholds,
+                x=n_nodes,
                 y=n_edges,
-                mode='lines+markers',
+                mode='lines' if is_list else 'lines+markers',
                 #title_text="n_edges vs threshold",
                 name='n_edges',
             ),
@@ -85,9 +120,9 @@ def plot_faithfulness(
         )
         fig.add_trace(
             go.Scatter(
-                x=thresholds,
+                x=n_nodes,
                 y=avg_deg,
-                mode='lines+markers',
+                mode='lines' if is_list else 'lines+markers',
                 #title_text="avg_deg vs threshold",
                 name='avg_deg',
             ),
@@ -95,9 +130,9 @@ def plot_faithfulness(
         )
         fig.add_trace(
             go.Scatter(
-                x=thresholds,
+                x=n_nodes,
                 y=density,
-                mode='lines+markers',
+                mode='lines' if is_list else 'lines+markers',
                 #title_text="density vs threshold",
                 name='density',
             ),
@@ -105,7 +140,13 @@ def plot_faithfulness(
         )
 
         # Update x-axes to log scale
-        fig.update_xaxes(type="log")
+        fig.update_xaxes(type="linear")
+        # Update y axes to crop between -0.5 and 1.5
+        for i in range(1, 5 + len(list(faithfulness.keys()))):
+            y_range = fig['data'][i-1]['y']
+            y_min = max(min(y_range), -0.5)
+            y_max = min(max(y_range), 1.5)
+            fig.update_yaxes(range=[y_min, y_max], row=i, col=1)
 
         # default layout is : height=600, width=800. We want to make it a bit bigger so that each plot has the original size
         fig.update_layout(

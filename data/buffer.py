@@ -1,8 +1,9 @@
+import os
+
 import torch
 import random
 
 from datasets import load_from_disk, load_dataset
-
 # TODO : return attn mask !
 
 boolean_expressions_path = "/home/pyllm/dhimoila/feature-circuits-1/data/datasets/boolean_expressions/"
@@ -59,7 +60,7 @@ class TokenBatches:
 
             # Deal with wikipedia or datasets with too long text
             if self.ctx_len is not None and self.ctx_len > 0:
-                clean_tokens = tokenizer(batch["clean"], return_tensors='pt', padding='max_length', truncation=True, max_length=self.ctx_len, return_attention_mask=False, return_token_type_ids=False)['input_ids'].to(self.device)
+                clean_tokens = tokenizer(batch["clean"], return_tensors='pt', padding='max_length', truncation=True, max_length=self.ctx_len, return_attention_mask=False, return_token_type_ids=False, add_special_tokens=False)['input_ids'].to(self.device)
                 trg_idx = torch.maximum(
                     self.ctx_len - 1 - torch.randn(clean_tokens.size(0), device=clean_tokens.device).abs() * 5,
                     torch.tensor([1]).to(clean_tokens.device).expand(clean_tokens.size(0))
@@ -68,7 +69,7 @@ class TokenBatches:
 
             # Deal with templates and toy tasks
             elif self.ctx_len is None or self.ctx_len <= 0:
-                clean_tokens = tokenizer(batch["clean"], return_tensors='pt', padding=True, return_attention_mask=False, return_token_type_ids=False)['input_ids'].to(self.device)
+                clean_tokens = tokenizer(batch["clean"], return_tensors='pt', padding=True, return_attention_mask=False, return_token_type_ids=False, add_special_tokens=False)['input_ids'].to(self.device)
                 
                 # good_field is used when there might be several correct answers. In this case, the clean tokens are a prefix without the answer appended.
                 if self.good_field is None:
@@ -78,12 +79,12 @@ class TokenBatches:
                     trg_idx = torch.zeros(clean_tokens.size(0), device=clean_tokens.device).long() - 1
                     trg = []
                     for i, good in enumerate(batch["good"]):
-                        trg.append(tokenizer(good, return_tensors='pt', return_attention_mask=False, return_token_type_ids=False)['input_ids'].to(self.device)[:, -1])
+                        trg.append(tokenizer(good, return_tensors='pt', return_attention_mask=False, return_token_type_ids=False, add_special_tokens=False)['input_ids'].to(self.device)[:, -1])
                     # can't stack these as they may have different lengths
                 
                 # Deal with counterfactuals
                 if self.corr_field is not None:
-                    corr_tokens = tokenizer(batch["corr"], return_tensors='pt', padding=True, return_attention_mask=False, return_token_type_ids=False)['input_ids'].to(self.device)
+                    corr_tokens = tokenizer(batch["corr"], return_tensors='pt', padding=True, return_attention_mask=False, return_token_type_ids=False, add_special_tokens=False)['input_ids'].to(self.device)
 
                     # Check that the counterfactuals have the same length as the clean text, otherwise patching won't work
                     if corr_tokens.shape != clean_tokens.shape:
@@ -97,7 +98,7 @@ class TokenBatches:
                     else:
                         corr_trg = []
                         for i, bad in enumerate(batch["bad"]):
-                            corr_trg.append(tokenizer(bad, return_tensors='pt', return_attention_mask=False, return_token_type_ids=False)['input_ids'].to(self.device)[:, -1])
+                            corr_trg.append(tokenizer(bad, return_tensors='pt', return_attention_mask=False, return_token_type_ids=False, add_special_tokens=False)['input_ids'].to(self.device)[:, -1])
                         # can't stack these as they may have different lengths
 
             else:
@@ -219,9 +220,20 @@ def gp_buffer(
         device,
         ctx_len=None,
         split='train',
-        perm = None,
+        perm=None,
+        shuffle=False,
+        model_name="",
 ):
-    gp_data = load_from_disk(gp_path)[split].shuffle()
+    path = gp_path
+    if model_name != "":
+        path = path + model_name + "/"
+        if not os.path.exists(path):
+            path = gp_path
+    gp_data = load_from_disk(path)[split]
+    if perm is not None:
+        gp_data = gp_data.select(perm)
+    elif shuffle:
+        gp_data = gp_data.shuffle()
     gp_iter = custom_iter(iter(gp_data), text_field='prefix', corr_field='corr_prefix', good_field='pronoun', bad_field='corr_pronoun', add_space=True)#, text_field=['prefix', 'pronoun'], corr_field=['corr_prefix', 'corr_pronoun'])
 
     buffer = TokenBatches(
@@ -244,9 +256,20 @@ def gt_buffer(
         device,
         ctx_len=None,
         split='train',
-        perm = None,
+        perm=None,
+        shuffle=False,
+        model_name="",
 ):
-    gt_data = load_from_disk(gt_path)[split].shuffle()
+    path = gt_path
+    if model_name != "":
+        path = path + model_name + "/"
+        if not os.path.exists(path):
+            path = gt_path
+    gt_data = load_from_disk(path)[split]
+    if perm is not None:
+        gt_data = gt_data.select(perm)
+    elif shuffle:
+        gt_data = gt_data.shuffle()
     gt_iter = custom_iter(iter(gt_data), text_field='prefix', corr_field='corr_prefix', good_field='good', bad_field='bad')
 
     buffer = TokenBatches(
@@ -269,14 +292,21 @@ def ioi_buffer(
         device,
         ctx_len=None,
         split='train',
-        perm = None,
+        perm=None,
+        shuffle=False,
+        model_name="",
 ):
-    ioi_data = load_from_disk(ioi_path)[split]
+    path = ioi_path
+    if model_name != "":
+        path = path + model_name + "/"
+        if not os.path.exists(path):
+            path = ioi_path
+    ioi_data = load_from_disk(path)[split]
     #print("IOI num rows", ioi_data.num_rows)
-    if perm is None:
-        ioi_data = ioi_data.shuffle()
-    else:
+    if perm is not None:
         ioi_data = ioi_data.select(perm)
+    elif shuffle:
+        ioi_data = ioi_data.shuffle()
     ioi_iter = custom_iter(iter(ioi_data), text_field='ioi_sentences', corr_field='corr_ioi_sentences', good_field='a', bad_field='b', add_space=True)#, text_field=['ioi_sentences', 'a'], corr_field=['corr_ioi_sentences', 'b'])
 
     buffer = TokenBatches(
@@ -300,6 +330,7 @@ def mixture_buffer(
         ctx_len=None,
         split='train',
 ):
+    raise NotImplementedError("Implement shuffle, perm and model_name")
     gp_data = load_from_disk(gp_path)[split].shuffle()
     gp_iter = custom_iter(iter(gp_data), text_field='prefix', corr_field='corr_prefix', good_field='pronoun', bad_field='corr_pronoun', add_space=True)#, text_field=['prefix', 'pronoun'], corr_field=['corr_prefix', 'corr_pronoun'])
     gt_data = load_from_disk(gt_path)[split].shuffle()

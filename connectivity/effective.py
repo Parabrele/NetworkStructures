@@ -194,6 +194,7 @@ def get_circuit_feature(
         steps=10, # int. Number of steps for the integrated gradients.
                   # When this value equals 1, only one gradient step is computed and the method is equivalent to
                   # the Attribution Patching's paper method.
+        freq=None, # dict. Frequency of feature usage in the circuit.
 ):
     """
     When feature dictionaries are not partitioned (~ endowed with the discrete partition)
@@ -260,7 +261,7 @@ def get_circuit_feature(
         shapes = {k.name : hidden_states_clean[k.name].act.shape for k in all_submods}
 
         rearrange_weights(shapes, edges)
-        aggregate_weights(shapes, edges, aggregation)
+        aggregate_weights(shapes, edges, aggregation, freq=freq)
 
         return edges
     
@@ -278,7 +279,7 @@ def get_circuit_feature(
             steps,
             metric_kwargs,
         )
-        aggregate_nodes(nodes, aggregation)
+        aggregate_nodes(nodes, aggregation, freq=freq, threshold=threshold)
         
         return nodes
 

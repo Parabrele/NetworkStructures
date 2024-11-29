@@ -21,19 +21,29 @@ def metric_fn_logit(model, kwargs={}):
         raise ValueError("Wrong arguments in metric_fn_logit")
 
     logits = module.output[torch.arange(trg_idx.numel()), trg_idx]
-    res = 0
+    
+    # Since logits are up to bias, if we have more targets possible than corrupted targets, the absolute value will not be meaningful
+    pos = 0
+    n_pos = 0
+    neg = 0
+    n_neg = 0
     if trg_pos is not None:
         if isinstance(trg_pos, torch.Tensor):
-            res += logits[trg_pos]
+            n_pos = trg_pos.numel()
+            pos += logits[trg_pos]
         elif isinstance(trg_pos, list):
             for i, tokens in enumerate(trg_pos):
-                res += logits[i, tokens].sum()
+                n_pos += 1
+                pos += logits[i, tokens].sum()
     if trg_neg is not None:
         if isinstance(trg_neg, torch.Tensor):
-            res -= logits[trg_neg]
+            n_neg = trg_neg.numel()
+            neg += logits[trg_neg]
         elif isinstance(trg_neg, list):
             for i, tokens in enumerate(trg_neg):
-                res -= logits[i, tokens].sum()
+                n_neg += 1
+                neg += logits[i, tokens].sum()
+    res = pos / max(n_pos, 1) - neg / max(n_neg, 1)
     return res
 
 def metric_fn_logit_extended(model, kwargs={}):

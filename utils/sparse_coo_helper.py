@@ -142,21 +142,6 @@ def sparse_permute(x, perm):
     new_indices = x.indices()[list(perm)]
     return t.sparse_coo_tensor(new_indices, x.values(), tuple(x.shape[perm[i]] for i in range(len(perm))))
 
-def __old__rearrange_weights(nodes, edges):
-    # rearrange weight matrices # dict : upstream -> downstream -> weight_matrix
-    for child in edges:
-        # get shape for child
-        bc, sc, fc = nodes[child].act.shape
-        for parent in edges[child]:
-            weight_matrix = edges[child][parent]
-            if parent == 'y':
-                weight_matrix = sparse_reshape(weight_matrix, (bc, sc, fc+1))
-            else:
-                bp, sp, fp = nodes[parent].act.shape
-                assert bp == bc
-                weight_matrix = sparse_reshape(weight_matrix, (bp, sp, fp+1, bc, sc, fc+1))
-            edges[child][parent] = weight_matrix
-
 def rearrange_weights(shapes, edges):
     # rearrange weight matrices # dict : downstream -> upstream -> weight_matrix
     for downstream in edges:
@@ -173,86 +158,44 @@ def rearrange_weights(shapes, edges):
                 weight_matrix = sparse_reshape(weight_matrix, (bd, sd, fd+1, bu, su, fu+1))
             edges[downstream][upstream] = weight_matrix
 
-def _save_all_batch(nodes, edges, aggregation, base_dir=None):
-    # TODO : save also the sequence, trg idx and trg
-    for child in edges:
-        b, _ = nodes[child].act.shape
-        break
+def update_frequency(freq, data, is_node=False, threshold=0.0):
+    # side effect on freq to count the number of times a feature is used.
+    # If freq is None, we are not trying to count that information.
+    if freq is not None:
+        if is_node:
+            # When circuit discovering nodes, data is a dict of SparseAct, not thresholded
+            for node in data:
+                if node != 'y':
+                    if freq.get(node) is None:
+                        freq[node] = 0
+                    b = data[node].act.shape[0]
+                    for i in range(b):
+                        freq[node] += (t.cat((data[node].act[i], data[node].resc[i])) > threshold)
+        else:
+            # When circuit discovering edges, data is a dict of dict of sparse_coo tensors, already thresholded.
+            for downstream in data:
+                for upstream in data[downstream]:
+                    w = data[downstream][upstream] # sparse_coo_tensor, shape [b, f+1] or [b, f+1, b, f+1]
+                    b = w.shape[0]
+                    for i in range(b):
+                        if downstream == 'y':
+                            # w has shape [b, f+1]
+                            idx = w[i].coalesce().indices()[0].unique()
+                            shape = w[i].shape[0]
+                        else:
+                            # w has shape [b, f+1, b, f+1] : indexing in sparse_coo tensors is weird, so take batch
+                            # for downstream, then permute dimensions and take batch for upstream. Now, we have a
+                            # weight matrix of shape [f_down, f_up]. Take the up indices and unique them.
+                            wii = sparse_permute(w[i], [1, 0, 2])[i]
+                            idx = wii.coalesce().indices()[1].unique()
+                            shape = wii.shape[1]
+                        
+                        if freq.get(upstream) is None:
+                            freq[upstream] = t.zeros(shape, dtype=t.int64, device=w.device)
+                        freq[upstream][idx] += 1
+                    
 
-    for k in range(b):
-        k_edges = {}
-        for child in edges:
-            k_edges[child] = {}
-            for parent in edges[child]:
-                weight_matrix = edges[child][parent]
-                if parent == 'y':
-                    weight_matrix = weight_matrix[k]
-                else:
-                    weight_matrix = weight_matrix[k] # shape (fp, bc, fc)
-                    # rearrange to (bc, fp, fc)
-                    weight_matrix = sparse_permute(weight_matrix, (1, 0, 2))[k]
-                k_edges[child][parent] = weight_matrix
-        
-        # save at base directory plus a unique identifier using the current time
-        if base_dir is None:
-            base_dir = f'/scratch/pyllm/dhimoila/output/dumped_circuits/{aggregation}/'
-        if not os.path.exists(base_dir):
-            os.makedirs(base_dir)
-        now = datetime.now()
-        unique_id = now.strftime("%Y%m%d_%H%M%S%f")
-        file_name = f"{unique_id}.pt"
-        save_dir = {
-            "edges" : k_edges,
-        }
-        with open(f'{base_dir}{file_name}', 'wb') as outfile:
-            t.save(save_dir, outfile)
-
-def __old__aggregate_weights(
-    nodes, edges, aggregation='max', dump_all=False, save_path=None
-):
-    if aggregation == 'sum':
-        w_y_s_fct = lambda w, b: w.sum(dim=1)
-        w_s_fct = lambda w, b: w.sum(dim=(1, 4))
-        n_s_fct = lambda n: n.sum(dim=1)
-
-        w_y_b_fct = lambda w, b: w.sum(dim=0) / b
-        w_b_fct = lambda w, b: w.sum(dim=(0, 2)) / b # TODO : shouldn't this be / (b**2) ?
-        n_b_fct = lambda n: n.mean(dim=0)
-    elif aggregation == 'max':
-        w_y_s_fct = lambda w, b: sparse_coo_amax(w, dim=1)
-        w_s_fct = lambda w, b: sparse_coo_amax(w, dim=(1, 4))
-        n_s_fct = lambda n: n.amax(dim=1)
-
-        w_y_b_fct = lambda w, b: sparse_coo_amax(w, dim=0)
-        w_b_fct = lambda w, b: sparse_coo_amax(w, dim=(0, 2))
-        n_b_fct = lambda n: n.amax(dim=0)
-    else:
-        raise ValueError(f"Unknown aggregation: {aggregation}")
-
-    def _aggregate(w_y_fct, w_fct, n_fct):
-        for child in edges:
-            shape = nodes[child].act.shape
-            b = shape[0]
-            for parent in edges[child]:
-                weight_matrix = edges[child][parent]
-                if parent == 'y':
-                    weight_matrix = w_y_fct(weight_matrix, b)
-                else:
-                    weight_matrix = w_fct(weight_matrix, b)
-                edges[child][parent] = weight_matrix
-        for node in nodes:
-            if node != 'y':
-                nodes[node] = n_fct(nodes[node])
-
-    # aggregate across sequence position
-    _aggregate(w_y_s_fct, w_s_fct, n_s_fct)
-    # dump all examples
-    if dump_all:
-        _save_all_batch(nodes, edges, aggregation, base_dir=save_path)
-    # aggregate across batch dimension
-    _aggregate(w_y_b_fct, w_b_fct, n_b_fct)
-
-def aggregate_nodes(nodes, aggregation='sum'):
+def aggregate_nodes(nodes, aggregation='sum', freq=None, threshold=0.0):
     if aggregation == 'sum':
         n_s_fct = lambda n: n.sum(dim=1)
         n_b_fct = lambda n: n.mean(dim=0)
@@ -269,11 +212,12 @@ def aggregate_nodes(nodes, aggregation='sum'):
 
     # aggregate across sequence position
     _aggregate(n_s_fct)
+    update_frequency(freq, nodes, is_node=True, threshold=threshold)
     # aggregate across batch dimension
     _aggregate(n_b_fct)
 
 def aggregate_weights(
-    shapes, edges, aggregation='sum', dump_all=False, save_path=None
+    shapes, edges, aggregation='sum', dump_all=False, save_path=None, freq=None
 ):
     if dump_all:
         raise NotImplementedError("dump_all is not implemented in the new version of aggregate_weights")
@@ -307,8 +251,6 @@ def aggregate_weights(
 
     # aggregate across sequence position
     _aggregate(w_y_s_fct, w_s_fct)
-    # dump all examples
-    # if dump_all:
-    #     _save_all_batch(nodes, edges, aggregation, base_dir=save_path)
+    update_frequency(freq, edges)
     # aggregate across batch dimension
     _aggregate(w_y_b_fct, w_b_fct)

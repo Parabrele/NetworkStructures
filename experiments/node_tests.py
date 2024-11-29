@@ -1,47 +1,27 @@
-"""
+# Run the faithfulness of circuits experiments.
 
-cd ~/NetworkStructures/
-python -m experiments.main &
-
-Local experiments :
-    For all x in X :
-        Get the circuit C_x for x.
-        Evaluate the faithfulness of C_x on x.
-    aggregate the results and plot
-
-    -> Measures the ability of our method to capture local computations.
-
-Global experiments :
-    For all x in X :
-        Get the circuit C_x for x.
-    Aggregate all C_x into a global circuit C.
-    For all x in X :
-        Evaluate the faithfulness of C on x.
-
-    -> Measures the ability of our method to capture global computations.
-
-"""
+###
+# In the correct directory, execute e.g. :
+# python -m experiments.main &
+###
 
 ##########
 # Get arguments from the command line
 ##########
 
+# DONE : faithfulness seems to be broken, negative even when KL is clearly low.
+#        Sometimes the empty circuit has very low KL, then the faithfulness is very negative and the mean of all gets negative.
+# TODO : crashes with empty circuit
 # TODO : test freq
 
 from argparse import ArgumentParser
 
 parser = ArgumentParser()
 
-parser.add_argument("--seed", type=int, default=42)
-
-parser.add_argument("--local", action="store_true", default=False)
-
 parser.add_argument("--dataset", type=str, default="ioi")
 
 parser.add_argument("--batch_size", type=int, default=1)
 parser.add_argument("--eval_batch_size", type=int, default=100)
-
-parser.add_argument("--model", type=str, default="EleutherAI/pythia-70m-deduped")
 
 parser.add_argument("--node_circuit", action="store_true", default=False)
 parser.add_argument("--threshold", type=float, default=1e-4)
@@ -75,6 +55,7 @@ from evaluation.faithfulness import faithfulness as faithfulness_fn
 
 from data.buffer import single_input_buffer, wikipedia_buffer, gp_buffer, gt_buffer, ioi_buffer, bool_buffer, mixture_buffer, unpack_batch
 
+
 from utils.ablation_fns import zero_ablation, mean_ablation, id_ablation
 from utils.savior import save_circuit
 from utils.plotting import plot_faithfulness
@@ -96,13 +77,12 @@ use_resid = True
 start_at_layer = args.start_at_layer
 threshold = args.threshold
 steps = 10
-get_freq = False
+get_freq = True
 
 experiment_name = ('resid' if use_resid else '') \
     + ('_' if use_resid and use_attn_mlp else '') \
     + ('attn_mlp' if use_attn_mlp else '') \
-    + '/' + ('edge' if edge_circuit else 'node') + '_ablation/' \
-    + ('local/' if args.local else 'global/')
+    + '/' + ('edge' if edge_circuit else 'node') + '_ablation/'
 
 save_path += args.dataset + '/'
 save_path += experiment_name
@@ -181,18 +161,18 @@ def normalize_circuit(circuit, factor):
         circuit = {k : {kk : vv / factor for kk, vv in v.items()} for k, v in circuit.items()}
     return circuit
 
-def global_circuit(circuit_fn, device_id=0, perm=None):
+def get_circuit(circuit_fn, device_id=0, perm=None):
     DEVICE = torch.device('cuda:{}'.format(device_id)) if torch.cuda.is_available() else torch.device('cpu')    
 
     # Set up the model and data
-    model, name2mod = load_model_and_modules(device=DEVICE, resid=use_resid, attn=use_attn_mlp, mlp=use_attn_mlp, start_at_layer=start_at_layer, model_name=args.model)
+    model, name2mod = load_model_and_modules(device=DEVICE, resid=use_resid, attn=use_attn_mlp, mlp=use_attn_mlp, start_at_layer=start_at_layer)
     architectural_graph = get_architectural_graph(model, name2mod)
     dictionaries = load_saes(model, name2mod, device=DEVICE)
 
     tot_circuit = None
     tot_inputs = 0
 
-    buffer = DATASET(model, batch_size, DEVICE, ctx_len=None, perm=perm, model_name=args.model)
+    buffer = DATASET(model, batch_size, DEVICE, ctx_len=None, perm=perm)
 
     # Compute the circuit
 
@@ -204,21 +184,47 @@ def global_circuit(circuit_fn, device_id=0, perm=None):
         b = tokens.shape[0]
         tot_inputs += b
 
-        circuit = circuit_fn(
-            clean=tokens,
-            patch=corr,
-            model=model,
-            architectural_graph=architectural_graph,
-            name2mod=name2mod,
-            dictionaries=dictionaries,
-            metric_fn=metric_fn_logit,
-            metric_kwargs={"trg_idx": trg_idx, "trg_pos": trg, "trg_neg": corr_trg},
-            ablation_fn=ablation_fn,
-            threshold=threshold,
-            steps=steps,
-            edge_circuit=edge_circuit,
-            freq=freq,
-        )
+        try:
+            circuit = circuit_fn(
+                clean=tokens,
+                patch=corr,
+                model=model,
+                architectural_graph=architectural_graph,
+                name2mod=name2mod,
+                dictionaries=dictionaries,
+                metric_fn=metric_fn_logit,
+                metric_kwargs={"trg_idx": trg_idx, "trg_pos": trg, "trg_neg": corr_trg},
+                ablation_fn=ablation_fn,
+                threshold=threshold,
+                steps=steps,
+                edge_circuit=edge_circuit,
+                freq=freq,
+            )
+        except ValueError as e:
+            print(e)
+            print(b)
+            print(tot_inputs)
+            print("Tokens :")
+            print(tokens.shape)
+            print(tokens)
+            print("Trg_idx :")
+            print(trg_idx.shape)
+            print(trg_idx)
+            print("Trg :")
+            print(trg.shape)
+            print(trg)
+            print("Corr :")
+            print(corr.shape)
+            print(corr)
+            print("Corr_trg :")
+            print(corr_trg.shape)
+            print(corr_trg)
+
+            tot_inputs -= b
+            import time
+            # sleep one minute
+            time.sleep(60)
+            continue
 
         tot_circuit = add_circuit(tot_circuit, circuit, b)
 
@@ -242,15 +248,15 @@ def global_circuit(circuit_fn, device_id=0, perm=None):
 
     return tot_circuit
 
-def global_faithfulness(circuit, perm=None):
+def get_faithfulness(circuit, perm=None):
     """
     Compute the faithfulness of the circuit.
     """
-    model, name2mod = load_model_and_modules(device=DEVICE, resid=use_resid, attn=use_attn_mlp, mlp=use_attn_mlp, start_at_layer=start_at_layer, model_name=args.model)
+    model, name2mod = load_model_and_modules(device=DEVICE, resid=use_resid, attn=use_attn_mlp, mlp=use_attn_mlp, start_at_layer=start_at_layer)
     architectural_graph = get_architectural_graph(model, name2mod)
     dictionaries = load_saes(model, name2mod, device=DEVICE)
 
-    buffer = DATASET(model, eval_batch_size, DEVICE, perm=perm, model_name=args.model)
+    buffer = DATASET(model, eval_batch_size, DEVICE, perm=perm)
 
     aggregated_outs = None
     n_batches = 0
@@ -305,112 +311,23 @@ def global_faithfulness(circuit, perm=None):
         for fn_name in out['completeness']:
             aggregated_outs[t]['completeness'][fn_name] /= n_batches
 
-    print("Number of batches : ", n_batches)
-    print("Number of inputs : ", tot_inputs)
     return aggregated_outs
 
-def local_circuit(circuit_fn, device_id=0, perm=None):
-    DEVICE = torch.device('cuda:{}'.format(device_id)) if torch.cuda.is_available() else torch.device('cpu')    
-
-    # Set up the model and data
-    model, name2mod = load_model_and_modules(device=DEVICE, resid=use_resid, attn=use_attn_mlp, mlp=use_attn_mlp, start_at_layer=start_at_layer, model_name=args.model)
-    architectural_graph = get_architectural_graph(model, name2mod)
-    dictionaries = load_saes(model, name2mod, device=DEVICE)
-
-    aggregated_outs = None
-    n_batches = 0
-    tot_inputs = 0
-
-    buffer = DATASET(model, 1, DEVICE, ctx_len=None, perm=perm, model_name=args.model)
-
-    # Compute the circuit
-
-    freq = {} if get_freq else None
-    
-    for batch in tqdm(buffer):
-        if tot_inputs > n_tests:
-            break
-
-        tokens, trg_idx, trg, corr, corr_trg = unpack_batch(batch)
-
-        b = tokens.shape[0]
-        tot_inputs += b
-        n_batches += 1
-
-        circuit = circuit_fn(
-            clean=tokens,
-            patch=corr,
-            model=model,
-            architectural_graph=architectural_graph,
-            name2mod=name2mod,
-            dictionaries=dictionaries,
-            metric_fn=metric_fn_logit,
-            metric_kwargs={"trg_idx": trg_idx, "trg_pos": trg, "trg_neg": corr_trg},
-            ablation_fn=ablation_fn,
-            threshold=threshold,
-            steps=steps,
-            edge_circuit=edge_circuit,
-            freq=freq,
-        )
-        
-        thresholds = torch.logspace(math.log10(threshold)-2, 0, nb_eval_thresholds, 10).tolist()
-
-        faithfulness = faithfulness_fn(
-            model,
-            name2mod,
-            dictionaries,
-            clean=tokens,
-            circuit=circuit,
-            architectural_graph=architectural_graph,
-            thresholds=thresholds,
-            metric_fn=metric_fn_dict,
-            metric_fn_kwargs={"trg_idx": trg_idx, "trg_pos": trg, "trg_neg": corr_trg},
-            patch=corr,
-            ablation_fn=ablation_fn,
-            default_ablation=default_ablation,
-            node_ablation=(not edge_circuit),
-        )
-
-        if aggregated_outs is None:
-            aggregated_outs = faithfulness
-            continue
-
-        for t, out in faithfulness.items():
-            if t == 'complete' or t == 'empty':
-                continue
-            else:
-                for k, v in aggregated_outs[t].items():
-                    if k == 'faithfulness' or k == 'completeness':
-                        for fn_name in v:
-                            if not isinstance(aggregated_outs[t][k][fn_name], list):
-                                aggregated_outs[t][k][fn_name] = [aggregated_outs[t][k][fn_name]]
-                            aggregated_outs[t][k][fn_name].append(out[k][fn_name])
-                    else:
-                        if not isinstance(aggregated_outs[t][k], list):
-                            aggregated_outs[t][k] = [aggregated_outs[t][k]]
-                        aggregated_outs[t][k].append(out[k])
-
-    # delete 'complete' and 'empty' keys from aggregated_outs
-    del aggregated_outs['complete']
-    del aggregated_outs['empty']
-    return aggregated_outs
-
-def run_global_circuit():
-    for n_elts in [8, 16, 32, 64, 128, 256]:
+if __name__ == "__main__":
+    # for n_elts in [8, 16, 32, 64, 128, 256]:
         ##########
         # Get Marks circuit
         ##########
 
         print("Getting circuit...")
 
-        seed = args.seed
+        seed = 42
 
         if True:#not os.path.exists(save_path+"circuit/merged/0.pt"):
             # set the seed
             torch.manual_seed(seed)
             perm = torch.randperm(n_elts)
-            print(perm)
-            available_gpus = max(1, torch.cuda.device_count())
+            available_gpus = torch.cuda.device_count()
             elts_per_gpu = n_elts // available_gpus
             if elts_per_gpu == 0:
                 elts_per_gpu = n_elts
@@ -421,7 +338,7 @@ def run_global_circuit():
                 futures = []
                 with ProcessPoolExecutor(max_workers=available_gpus) as executor:
                     for i in range(available_gpus):
-                        futures.append(executor.submit(global_circuit, get_circuit_feature, i, perm[i*elts_per_gpu:(i+1)*elts_per_gpu]))
+                        futures.append(executor.submit(get_circuit, get_circuit_feature, i, perm[i*elts_per_gpu:(i+1)*elts_per_gpu]))
 
                 tot_circuit = None
                 for future in futures:
@@ -477,13 +394,17 @@ def run_global_circuit():
                 for i, f in enumerate(freq):
                     attr_per_freq[i] = all_attr[all_flattened == f].mean()
                 
-                # # Create a histogram and print it :
-                # print(freq)
-                # print(freq.shape)
-                # print(count)
-                # print(count.shape)
-                # print(attr_per_freq)
-                # print(attr_per_freq.shape)
+                # Create a histogram and print it :
+                print(freq)
+                print(freq.shape)
+                print(count)
+                print(count.shape)
+                print(attr_per_freq)
+                print(attr_per_freq.shape)
+
+                # All nodes appearing less than 25 times are removed :
+                for k in tot_freq.keys():
+                    circuit[k].act[tot_freq[k][:-1] < 5] = 0
 
         else:
             # Load the circuit :
@@ -499,56 +420,6 @@ def run_global_circuit():
         print("Evaluation")
         torch.manual_seed(seed)
         perm = torch.randperm(n_elts)
-        print(f"Number of elements : {n_elts}")
-        aggregated_outs = global_faithfulness(circuit, perm)
-        plot_faithfulness(aggregated_outs, save_path=save_path+f"{n_elts}/")
+        aggregated_outs = get_faithfulness(circuit, perm)
+        plot_faithfulness(aggregated_outs, save_path=save_path+f"test_freq/{n_elts}/")
         print("Done.")
-
-def run_local_circuit():
-    ##########
-    # Get Marks circuit
-    ##########
-
-    print("Getting circuit...")
-
-    seed = args.seed
-
-    # set the seed
-    torch.manual_seed(seed)
-    perm = torch.randperm(n_elts)
-    available_gpus = max(1, torch.cuda.device_count())
-    elts_per_gpu = n_elts // available_gpus
-    if elts_per_gpu == 0:
-        elts_per_gpu = n_elts
-        available_gpus = 1
-    
-    # Sometimes this crashes right at the end, I don't know why, so I just manually get the last saved circuit and add them.
-    futures = []
-    with ProcessPoolExecutor(max_workers=available_gpus) as executor:
-        for i in range(available_gpus):
-            futures.append(executor.submit(local_circuit, get_circuit_feature, i, perm[i*elts_per_gpu:(i+1)*elts_per_gpu]))
-
-    aggregated_faith = None
-    for future in futures:
-        faith = future.result()
-        if aggregated_faith is None:
-            aggregated_faith = faith
-            continue
-        for t, out in faith.items():
-            if t == 'complete' or t == 'empty':
-                continue
-            for k, v in aggregated_faith[t].items():
-                if k == 'faithfulness' or k == 'completeness':
-                    for fn_name in v:
-                        aggregated_faith[t][k][fn_name] += out[k][fn_name]
-                else:
-                    aggregated_faith[t][k] += out[k]
-    
-    plot_faithfulness(aggregated_faith, save_path=save_path+f"{n_elts}/")
-    print("Done.")
-
-if __name__ == "__main__":
-    if args.local:
-        run_local_circuit()
-    else:
-        run_global_circuit()
