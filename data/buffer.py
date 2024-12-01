@@ -10,6 +10,8 @@ boolean_expressions_path = "/home/pyllm/dhimoila/feature-circuits-1/data/dataset
 gp_path = "/home/pyllm/dhimoila/feature-circuits-1/data/datasets/gp/"
 gt_path = "/home/pyllm/dhimoila/feature-circuits-1/data/datasets/gt/"
 ioi_path = "/home/pyllm/dhimoila/feature-circuits-1/data/datasets/ioi/"
+simple_rc_path = "/home/pyllm/dhimoila/NetworkStructures/data/datasets/rc/simple/"
+rc_path = "/home/pyllm/dhimoila/NetworkStructures/data/datasets/rc/"
 
 class TokenBatches:
     """
@@ -79,7 +81,11 @@ class TokenBatches:
                     trg_idx = torch.zeros(clean_tokens.size(0), device=clean_tokens.device).long() - 1
                     trg = []
                     for i, good in enumerate(batch["good"]):
-                        trg.append(tokenizer(good, return_tensors='pt', return_attention_mask=False, return_token_type_ids=False, add_special_tokens=False)['input_ids'].to(self.device)[:, -1])
+                        ith_trg = tokenizer(good, return_tensors='pt', return_attention_mask=False, return_token_type_ids=False, add_special_tokens=False)['input_ids'].to(self.device)
+                        if ith_trg.size(1) != 1:
+                            raise ValueError(f"Good field {good} should be a single token, but got {ith_trg.size(1)}")
+                        trg.append(ith_trg[:, -1])
+                    
                     # can't stack these as they may have different lengths
                 
                 # Deal with counterfactuals
@@ -88,8 +94,8 @@ class TokenBatches:
 
                     # Check that the counterfactuals have the same length as the clean text, otherwise patching won't work
                     if corr_tokens.shape != clean_tokens.shape:
-                        print(clean_tokens)
-                        print(corr_tokens)
+                        # print(clean_tokens)
+                        # print(corr_tokens)
                         raise ValueError(f"Shape of tokenized clean {clean_tokens.shape} and corr {corr_tokens.shape} don't match. Please check that counterfactuals always have the same length as the clean text.")
                     
                     # bad_field is used when there might be several wrong answers. In this case, the counterfactual tokens are a prefix without the answer appended.
@@ -98,7 +104,10 @@ class TokenBatches:
                     else:
                         corr_trg = []
                         for i, bad in enumerate(batch["bad"]):
-                            corr_trg.append(tokenizer(bad, return_tensors='pt', return_attention_mask=False, return_token_type_ids=False, add_special_tokens=False)['input_ids'].to(self.device)[:, -1])
+                            ith_corr_trg = tokenizer(bad, return_tensors='pt', return_attention_mask=False, return_token_type_ids=False, add_special_tokens=False)['input_ids'].to(self.device)
+                            if ith_corr_trg.size(1) != 1:
+                                raise ValueError(f"Bad field {bad} should be a single token, but got {ith_corr_trg.size(1)}")
+                            corr_trg.append(ith_corr_trg[:, -1])
                         # can't stack these as they may have different lengths
 
             else:
@@ -164,6 +173,31 @@ def unpack_batch(batch):
         corr_trg = batch["corr_trg"]
     return tokens, trg_idx, trg, corr, corr_trg
 
+def sanitize_data(data, buffer):
+    import torch
+    
+    # Create a boolean selection mask initialized to True
+    selection = torch.ones(data.num_rows, dtype=torch.bool)
+    i = 0
+
+    while True:
+        try:
+            batch = next(buffer)  # Try getting the next batch from the buffer
+            i += 1
+        except StopIteration:
+            # Break the loop when StopIteration is raised
+            break
+        except ValueError:
+            # Handle ValueError by marking the current row as False in selection
+            selection[i] = False
+            i += 1
+            continue
+        except Exception as e:
+            # Raise any unknown errors
+            raise RuntimeError(f"Unknown error encountered: {e}")
+    
+    return selection
+
 class custom_iter:
     def __init__(self, data, text_field, corr_field=None, good_field=None, bad_field=None, add_space=False):
         self.data = data
@@ -198,6 +232,7 @@ def bool_buffer(
         ctx_len=None,
         split='train',
 ):
+    raise NotImplementedError("Check that this function is still working")
     bool_data = load_from_disk(boolean_expressions_path)[split].shuffle()
     bool_iter = custom_iter(iter(bool_data), text_field=['input', 'target'])
 
@@ -222,8 +257,8 @@ def gp_buffer(
         split='train',
         perm=None,
         shuffle=False,
-        model_name="",
 ):
+    raise NotImplementedError("Check that this function is still working")
     path = gp_path
     if model_name != "":
         path = path + model_name + "/"
@@ -258,8 +293,8 @@ def gt_buffer(
         split='train',
         perm=None,
         shuffle=False,
-        model_name="",
 ):
+    raise NotImplementedError("Check that this function is still working")
     path = gt_path
     if model_name != "":
         path = path + model_name + "/"
@@ -294,15 +329,25 @@ def ioi_buffer(
         split='train',
         perm=None,
         shuffle=False,
-        model_name="",
 ):
-    path = ioi_path
-    if model_name != "":
-        path = path + model_name + "/"
-        if not os.path.exists(path):
-            path = ioi_path
-    ioi_data = load_from_disk(path)[split]
-    #print("IOI num rows", ioi_data.num_rows)
+    ioi_data = load_from_disk(ioi_path)[split]
+    # sanity check
+    sanity_iter = custom_iter(iter(ioi_data), text_field='ioi_sentences', corr_field='corr_ioi_sentences', good_field='a', bad_field='b', add_space=True)
+    sanity_buffer = TokenBatches(
+        sanity_iter,
+        model,
+        ctx_len=None,
+        batch_size=1,
+        device=device,
+        max_number_of_yields=ioi_data.num_rows,
+        corr_field='corr',
+        good_field='good',
+        bad_field='bad',
+    )
+    selection = sanitize_data(ioi_data, sanity_buffer)
+    ioi_data = ioi_data.select(selection)
+
+    # actual buffer
     if perm is not None:
         ioi_data = ioi_data.select(perm)
     elif shuffle:
@@ -321,6 +366,102 @@ def ioi_buffer(
         bad_field='bad',
     )
     
+    return buffer
+
+def rc_buffer(
+        model,
+        batch_size,
+        device,
+        ctx_len=None,
+        split='train',
+        perm=None,
+        shuffle=False,
+):
+    rc_data = load_from_disk(rc_path)[split]
+
+    # sanity check
+    sanity_iter = custom_iter(iter(rc_data), text_field='clean_prefix', corr_field='patch_prefix', good_field='clean_answer', bad_field='patch_answer')
+    sanity_buffer = TokenBatches(
+        sanity_iter,
+        model,
+        ctx_len=None,
+        batch_size=1,
+        device=device,
+        max_number_of_yields=rc_data.num_rows,
+        corr_field='corr',
+        good_field='good',
+        bad_field='bad',
+    )
+    selection = sanitize_data(rc_data, sanity_buffer)
+    rc_data = rc_data.select(selection.nonzero().squeeze())
+
+    # actual buffer
+    if perm is not None:
+        rc_data = rc_data.select(perm)
+    elif shuffle:
+        rc_data = rc_data.shuffle()
+    rc_iter = custom_iter(iter(rc_data), text_field='clean_prefix', corr_field='patch_prefix', good_field='clean_answer', bad_field='patch_answer')
+
+    buffer = TokenBatches(
+        rc_iter,
+        model,
+        ctx_len=None,
+        batch_size=batch_size,
+        device=device,
+        max_number_of_yields=rc_data.num_rows,
+        corr_field='corr',
+        good_field='good',
+        bad_field='bad',
+    )
+
+    return buffer
+
+def simple_rc_buffer(
+        model,
+        batch_size,
+        device,
+        ctx_len=None,
+        split='train',
+        perm=None,
+        shuffle=False,
+):
+    rc_data = load_from_disk(simple_rc_path)[split]
+
+    # sanity check
+    sanity_iter = custom_iter(iter(rc_data), text_field='clean_prefix', corr_field='patch_prefix', good_field='clean_answer', bad_field='patch_answer')
+    sanity_buffer = TokenBatches(
+        sanity_iter,
+        model,
+        ctx_len=None,
+        batch_size=1,
+        device=device,
+        max_number_of_yields=rc_data.num_rows,
+        corr_field='corr',
+        good_field='good',
+        bad_field='bad',
+    )
+    selection = sanitize_data(rc_data, sanity_buffer)
+    rc_data = rc_data.select(selection.nonzero().squeeze())
+
+    # actual buffer
+    if perm is not None:
+        rc_data = rc_data.select(perm)
+    elif shuffle:
+        rc_data = rc_data.shuffle()
+    rc_iter = custom_iter(iter(rc_data), text_field='clean_prefix', corr_field='patch_prefix', good_field='clean_answer', bad_field='patch_answer')
+
+    buffer = TokenBatches(
+        rc_iter,
+        model,
+        ctx_len=None,
+        batch_size=batch_size,
+        device=device,
+        max_number_of_yields=rc_data.num_rows,
+        corr_field='corr',
+        good_field='good',
+        bad_field='bad',
+    )
+
     return buffer
 
 def mixture_buffer(

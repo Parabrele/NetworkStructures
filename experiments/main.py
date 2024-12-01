@@ -36,7 +36,7 @@ parser.add_argument("--seed", type=int, default=42)
 
 parser.add_argument("--local", action="store_true", default=False)
 
-parser.add_argument("--dataset", type=str, default="ioi")
+parser.add_argument("--dataset", type=str, default="simple_rc")
 
 parser.add_argument("--batch_size", type=int, default=1)
 parser.add_argument("--eval_batch_size", type=int, default=100)
@@ -73,7 +73,7 @@ from connectivity.effective import get_circuit_feature
 
 from evaluation.faithfulness import faithfulness as faithfulness_fn
 
-from data.buffer import single_input_buffer, wikipedia_buffer, gp_buffer, gt_buffer, ioi_buffer, bool_buffer, mixture_buffer, unpack_batch
+from data.buffer import single_input_buffer, wikipedia_buffer, gp_buffer, gt_buffer, ioi_buffer, bool_buffer, mixture_buffer, unpack_batch, rc_buffer, simple_rc_buffer
 
 from utils.ablation_fns import zero_ablation, mean_ablation, id_ablation
 from utils.savior import save_circuit
@@ -114,12 +114,24 @@ nb_eval_thresholds = 20
 
 if args.dataset == "ioi":
     DATASET = ioi_buffer
+    tot_elts = 1000
     n_elts = 200
     n_tests = 200
 elif args.dataset == "mixture":
     DATASET = mixture_buffer
+    tot_elts = 3000
     n_elts = 600
     n_tests = 600
+elif args.dataset == "simple_rc":
+    DATASET = simple_rc_buffer
+    tot_elts = 400
+    n_elts = 200
+    n_tests = 200
+elif args.dataset == "rc":
+    DATASET = rc_buffer
+    tot_elts = 400
+    n_elts = 200
+    n_tests = 200
 else:
     raise ValueError(f"Unknown dataset : {args.dataset}")
 
@@ -192,7 +204,7 @@ def global_circuit(circuit_fn, device_id=0, perm=None):
     tot_circuit = None
     tot_inputs = 0
 
-    buffer = DATASET(model, batch_size, DEVICE, ctx_len=None, perm=perm, model_name=args.model)
+    buffer = DATASET(model, batch_size, DEVICE, ctx_len=None, perm=perm)
 
     # Compute the circuit
 
@@ -250,7 +262,7 @@ def global_faithfulness(circuit, perm=None):
     architectural_graph = get_architectural_graph(model, name2mod)
     dictionaries = load_saes(model, name2mod, device=DEVICE)
 
-    buffer = DATASET(model, eval_batch_size, DEVICE, perm=perm, model_name=args.model)
+    buffer = DATASET(model, eval_batch_size, DEVICE, perm=perm)
 
     aggregated_outs = None
     n_batches = 0
@@ -321,7 +333,7 @@ def local_circuit(circuit_fn, device_id=0, perm=None):
     n_batches = 0
     tot_inputs = 0
 
-    buffer = DATASET(model, 1, DEVICE, ctx_len=None, perm=perm, model_name=args.model)
+    buffer = DATASET(model, 1, DEVICE, ctx_len=None, perm=perm)
 
     # Compute the circuit
 
@@ -408,8 +420,7 @@ def run_global_circuit():
         if True:#not os.path.exists(save_path+"circuit/merged/0.pt"):
             # set the seed
             torch.manual_seed(seed)
-            perm = torch.randperm(n_elts)
-            print(perm)
+            perm = torch.randperm(tot_elts)[:n_elts]
             available_gpus = max(1, torch.cuda.device_count())
             elts_per_gpu = n_elts // available_gpus
             if elts_per_gpu == 0:
@@ -497,9 +508,8 @@ def run_global_circuit():
         ##########
 
         print("Evaluation")
-        torch.manual_seed(seed)
-        perm = torch.randperm(n_elts)
-        print(f"Number of elements : {n_elts}")
+        perm = torch.randperm(tot_elts)[:n_tests]
+        print(f"Number of elements : {n_tests}")
         aggregated_outs = global_faithfulness(circuit, perm)
         plot_faithfulness(aggregated_outs, save_path=save_path+f"{n_elts}/")
         print("Done.")
@@ -515,7 +525,7 @@ def run_local_circuit():
 
     # set the seed
     torch.manual_seed(seed)
-    perm = torch.randperm(n_elts)
+    perm = torch.randperm(tot_elts)[:n_elts]
     available_gpus = max(1, torch.cuda.device_count())
     elts_per_gpu = n_elts // available_gpus
     if elts_per_gpu == 0:
