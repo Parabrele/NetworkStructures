@@ -84,11 +84,12 @@ def get_edge_attr_feature(
                     fs[upstream_name] = []
                 fs[upstream_name].append(upstream_act)
                 
-                reconstructed_input += dictionaries[upstream_name].decode(upstream_act.act) + upstream_act.res
+                up_out = dictionaries[upstream_name].decode(upstream_act.act) + upstream_act.res
+                reconstructed_input += name2mod[upstream_name].LN_post.forward(up_out)
             
             if downstream != 'y':
                 # get the new output of the downstream module.
-                ln = reconstructed_input if downstream_submod.LN is None else downstream_submod.LN.forward(reconstructed_input)
+                ln = downstream_submod.LN_pre.forward(reconstructed_input)
                 if 'attn' in downstream:
                     y = downstream_submod.module.forward(ln, ln, ln)
                 elif 'mlp' in downstream:
@@ -106,7 +107,9 @@ def get_edge_attr_feature(
                 else:
                     raise ValueError(f"Downstream module {downstream} not recognized")
                 
-                y_hat, g = dictionaries[downstream](y, output_features=True)
+                # TODO : check that with autograd and all these interventions, the gradients are properly computed
+                g = dictionaries[downstream].encode(y)
+                y_hat = dictionaries[downstream].decode(g)
                 y_res = y - y_hat
                 downstream_act = SparseAct(
                     act=g,
@@ -123,7 +126,7 @@ def get_edge_attr_feature(
                     # Get the scalar value (coeff) of the downstream feature
                     diff = downstream_act.act[..., seq_idx, feat_idx] - hidden_states_clean[downstream].act[..., seq_idx, feat_idx]
                     # Use this to scale the target feature vector
-                    diff = diff * dictionaries[downstream].decoder.weight[:, feat_idx]
+                    diff = diff * dictionaries[downstream].W_dec[feat_idx]
             
                 with model.trace(clean, **tracer_kwargs):
                     if is_tuple[downstream]:

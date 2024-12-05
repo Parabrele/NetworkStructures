@@ -1,7 +1,7 @@
 """
 
 cd ~/NetworkStructures/
-python -m experiments.main &
+python -m experiments.main --model gpt2 --start_at_layer 4 --local --node_circuit &
 
 Local experiments :
     For all x in X :
@@ -104,6 +104,7 @@ experiment_name = ('resid' if use_resid else '') \
     + '/' + ('edge' if edge_circuit else 'node') + '_ablation/' \
     + ('local/' if args.local else 'global/')
 
+save_path += args.model + '/'
 save_path += args.dataset + '/'
 save_path += experiment_name
 
@@ -199,7 +200,7 @@ def global_circuit(circuit_fn, device_id=0, perm=None):
     # Set up the model and data
     model, name2mod = load_model_and_modules(device=DEVICE, resid=use_resid, attn=use_attn_mlp, mlp=use_attn_mlp, start_at_layer=start_at_layer, model_name=args.model)
     architectural_graph = get_architectural_graph(model, name2mod)
-    dictionaries = load_saes(model, name2mod, device=DEVICE)
+    dictionaries = load_saes(model, name2mod)
 
     tot_circuit = None
     tot_inputs = 0
@@ -260,7 +261,7 @@ def global_faithfulness(circuit, perm=None):
     """
     model, name2mod = load_model_and_modules(device=DEVICE, resid=use_resid, attn=use_attn_mlp, mlp=use_attn_mlp, start_at_layer=start_at_layer, model_name=args.model)
     architectural_graph = get_architectural_graph(model, name2mod)
-    dictionaries = load_saes(model, name2mod, device=DEVICE)
+    dictionaries = load_saes(model, name2mod)
 
     buffer = DATASET(model, eval_batch_size, DEVICE, perm=perm)
 
@@ -317,8 +318,6 @@ def global_faithfulness(circuit, perm=None):
         for fn_name in out['completeness']:
             aggregated_outs[t]['completeness'][fn_name] /= n_batches
 
-    print("Number of batches : ", n_batches)
-    print("Number of inputs : ", tot_inputs)
     return aggregated_outs
 
 def local_circuit(circuit_fn, device_id=0, perm=None):
@@ -327,7 +326,7 @@ def local_circuit(circuit_fn, device_id=0, perm=None):
     # Set up the model and data
     model, name2mod = load_model_and_modules(device=DEVICE, resid=use_resid, attn=use_attn_mlp, mlp=use_attn_mlp, start_at_layer=start_at_layer, model_name=args.model)
     architectural_graph = get_architectural_graph(model, name2mod)
-    dictionaries = load_saes(model, name2mod, device=DEVICE)
+    dictionaries = load_saes(model, name2mod)
 
     aggregated_outs = None
     n_batches = 0

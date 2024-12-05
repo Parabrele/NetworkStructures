@@ -1,19 +1,59 @@
 import torch
 
-from nnsight import LanguageModel
 from nnsight.models.UnifiedTransformer import UnifiedTransformer
-from utils.utils import Submod
-from utils.dictionary import IdentityDict, LinearDictionary, AutoEncoder
 
-def load_model_and_modules(device, model_name="EleutherAI/pythia-70m-deduped", resid=True, attn=True, mlp=True, start_at_layer=-1):
+from sae_lens import SAE
+
+from utils.utils import Submod
+from utils.dictionary import IdentityDict
+
+model_name_to_processing = {
+    "pythia-70m-deduped" : False,
+    "gpt2" : True,
+}
+
+model_name_to_sae_release = {
+    "pythia-70m-deduped" : "pythia-70m-deduped-{M}-sm",
+    "gpt2" : "gpt2-small-{M}-jb",
+    "gemma-2-2b" : "gemma-scope-2b-pt-{M}",
+}
+
+model_hook_resid_pre = {
+    "pythia-70m-deduped" : False,
+    "gpt2" : True,
+    "gemma-2-2b" : False,
+}
+
+DEFAULT_IDS = {
+    "pythia-70m-deduped" : {
+        "embed" : "blocks.0.hook_resid_pre",
+        "resid" : "blocks.{L}.hook_resid_post",
+        "attn" : "blocks.{L}.hook_attn_out",
+        "mlp" : "blocks.{L}.hook_mlp_out",
+    },
+    "gpt2" : {
+        "embed" : "blocks.0.hook_resid_pre",
+        "resid" : "blocks.{L}.hook_resid_pre",
+    },
+    "gemma-2-2b" : {
+        "resid" : "layer_{L}/width_65k/canonical",
+        "attn" : "layer_{L}/width_65k/canonical",
+        "mlp" : "layer_{L}/width_65k/canonical",
+    }
+}
+
+def load_model_and_modules(device, model_name="pythia-70m-deduped", resid=True, attn=True, mlp=True, start_at_layer=-1, processing=None):
     """
     start_at_layer : int
         The layer to start loading modules from. If -1, load all layers. If 0, start from 'resid_0'.
     """
+    processing = model_name_to_processing.get(model_name, None)
+    if processing is None:
+        raise ValueError(f"Model {model_name} has no default processing setting. Provide your own. Processing is used as argument for the UnifiedTransformer model and handles wrapping of LN and such into the rest of the weights.")
     model = UnifiedTransformer(
         model_name,
         device=device,
-        processing=False,
+        processing=processing,
     )
     model.device = model.cfg.device
     model.tokenizer.padding_side = 'left'
@@ -26,9 +66,9 @@ def load_model_and_modules(device, model_name="EleutherAI/pythia-70m-deduped", r
     
     for i in range(max(0, start_at_layer), len(model.blocks)):
         if attn and start_at_layer < i:
-            name2mod[f'attn_{i}'] = Submod(f'attn_{i}', model.blocks[i].attn, model.blocks[i].ln1)
+            name2mod[f'attn_{i}'] = Submod(f'attn_{i}', model.blocks[i].attn, model.blocks[i].ln1, model.blocks[i].ln1_post)
         if mlp and start_at_layer < i:
-            name2mod[f'mlp_{i}'] = Submod(f'mlp_{i}', model.blocks[i].mlp, model.blocks[i].ln2)
+            name2mod[f'mlp_{i}'] = Submod(f'mlp_{i}', model.blocks[i].mlp, model.blocks[i].ln2, model.blocks[i].ln2_post)
         if resid or start_at_layer == i:
             name2mod[f'resid_{i}'] = Submod(f'resid_{i}', model.blocks[i])
         
@@ -82,232 +122,83 @@ def load_saes(
     model,
     name2mod,
     idd=False,
-    svd=False,
-    white=False,
-    device='cpu',
-    path='/scratch/pyllm/dhimoila/',
-    unified=True
+    release=None,
+    id_dict=DEFAULT_IDS, # SAE-lens IDs for each sae. Should be a dict model_name -> module_type -> id.
+    hook_resid_pre=None, # Whether SAEs were trained on resid pre or resid post.
 ):
-    if white:
-        raise NotImplementedError("Whitening is not implemented yet.")
     dictionaries = {}
-
-    d_model = 512
-    dict_size = 32768 if not svd else 512
 
     if idd:
         for name in name2mod:
-            dictionaries[name] = IdentityDict(d_model)
-
+            dictionaries[name] = IdentityDict()
         return dictionaries
+
+    model_name = model.cfg.model_name
+    if release is None:
+        release = model_name_to_sae_release.get(model_name, None)
+    if hook_resid_pre is None:
+        hook_resid_pre = model_hook_resid_pre.get(model_name, None)
+    if release is None:
+        raise ValueError(f"Model {model_name} not supported by default. Provide your own release and id_dict.")
+    if model_name not in id_dict:
+        raise ValueError(f"Model {model_name} not supported by default. Provide your own id_dict.")
+    if hook_resid_pre is None:
+        raise ValueError(f"Model {model_name} not supported by default. Provide your own hook_resid_pre.")
     
-    path = path + "dictionaires/pythia-70m-deduped/"# + ("SVDdicts/" if svd else "")
+    if 'embed' in name2mod:
+        sae_id = id_dict[model_name].get('embed', None)
+        if sae_id is None:
+            raise ValueError(f"Current settings for model {model_name} does not support an SAE for the embedding layer. Provide your own in id_dict.")
+        dictionaries['embed'] = SAE.from_pretrained(release.format(M='res'), sae_id)[0]
 
-    if not svd:
-        ae = AutoEncoder(d_model, dict_size).to(device)
-        ae.load_state_dict(torch.load(path + f"embed/ae.pt", map_location=device))
-        dictionaries['embed'] = ae
-    else:
-        d = torch.load(path + f"embed/cov.pt", map_location=device)
-        mean = d['mean']
-        cov = d['cov']
-        U, S, V = torch.svd(cov)
-        dictionaries['embed'] = LinearDictionary(d_model, dict_size)
-        dictionaries['embed'].E = V.T
-        dictionaries['embed'].D = V
-        dictionaries['embed'].bias = mean
-
-    for layer in range(len(model.gpt_neox.layers if not unified else model.blocks)):
-        if not svd:
-            ae = AutoEncoder(d_model, dict_size).to(device)
-            ae.load_state_dict(torch.load(path + f"resid_out_layer{layer}/ae.pt", map_location=device))
-            dictionaries[f'resid_{layer}'] = ae
-        else:
-            d = torch.load(path + f"resid_out_layer{layer}/cov.pt", map_location=device)
-            mean = d['mean']
-            cov = d['cov']
-            U, S, V = torch.svd(cov) # cov is symmetric so U = V
-            dictionaries[f'resid_{layer}'] = LinearDictionary(d_model, dict_size)
-            dictionaries[f'resid_{layer}'].E = V.T
-            dictionaries[f'resid_{layer}'].D = V
-            dictionaries[f'resid_{layer}'].bias = mean
+    for layer in range(len(model.blocks)):
+        if f'resid_{layer}' in name2mod:
+            sae_id = id_dict[model_name].get('resid', None)
+            if sae_id is None:
+                raise ValueError(f"Current settings for model {model_name} does not support an SAE for the residual layers. Provide your own in id_dict.")
+            replacement_for_gpt2small_jb_why_do_you_not_do_as_everyone_else = "blocks.11.hook_resid_post"
+            dictionaries[f'resid_{layer}'] = SAE.from_pretrained(
+                release.format(M='res'),
+                sae_id.format(L=(layer+1 if hook_resid_pre else layer)) if not (model_name == "gpt2" and layer == 11) else replacement_for_gpt2small_jb_why_do_you_not_do_as_everyone_else
+            )[0]
         
-        if not svd:
-            ae = AutoEncoder(d_model, dict_size).to(device)
-            ae.load_state_dict(torch.load(path + f"attn_out_layer{layer}/ae.pt", map_location=device))
-            dictionaries[f'attn_{layer}'] = ae
-        else:
-            d = torch.load(path + f"attn_out_layer{layer}/cov.pt", map_location=device)
-            mean = d['mean']
-            cov = d['cov']
-            U, S, V = torch.svd(cov)
-            dictionaries[f'attn_{layer}'] = LinearDictionary(d_model, dict_size)
-            dictionaries[f'attn_{layer}'].E = V.T # This will perform the operation x @ E.T = x @ V, but V is in it's transposed form
-            dictionaries[f'attn_{layer}'].D = V
-            dictionaries[f'attn_{layer}'].bias = mean
+        if f'attn_{layer}' in name2mod:
+            sae_id = id_dict[model_name].get('attn', None)
+            if sae_id is None:
+                raise ValueError(f"Current settings for model {model_name} does not support an SAE for the attention layers. Provide your own in id_dict.")
+            dictionaries[f'attn_{layer}'] = SAE.from_pretrained(
+                release.format(M='att'),
+                sae_id.format(L=layer)
+            )[0]
 
-        if not svd:
-            ae = AutoEncoder(d_model, dict_size).to(device)
-            ae.load_state_dict(torch.load(path + f"mlp_out_layer{layer}/ae.pt", map_location=device))
-            dictionaries[f'mlp_{layer}'] = ae
-        else:
-            d = torch.load(path + f"mlp_out_layer{layer}/cov.pt", map_location=device)
-            mean = d['mean']
-            cov = d['cov']
-            U, S, V = torch.svd(cov)
-            dictionaries[f'mlp_{layer}'] = LinearDictionary(d_model, dict_size)
-            dictionaries[f'mlp_{layer}'].E = V.T
-            dictionaries[f'mlp_{layer}'].D = V
-            dictionaries[f'mlp_{layer}'].bias = mean
+        if f'mlp_{layer}' in name2mod:
+            sae_id = id_dict[model_name].get('mlp', None)
+            if sae_id is None:
+                raise ValueError(f"Current settings for model {model_name} does not support an SAE for the MLP layers. Provide your own in id_dict.")
+            dictionaries[f'mlp_{layer}'] = SAE.from_pretrained(
+                release.format(M='mlp'),
+                sae_id.format(L=layer)
+            )[0]
     
-    dictionaries['y'] = dictionaries[f'resid_{len(model.gpt_neox.layers if not unified else model.blocks)-1}']
-    return dictionaries
+    # TODO : check that 'y' SAE is never used.
+    # try:
+    #     TODO : load this one separately since some times "resid" modules might not be in name2mod.
+    #     sae_id = id_dict[model_name].get('resid', None)
+    #         if sae_id is None:
+    #             raise ValueError(f"Current settings for model {model_name} does not support an SAE for the residual layers. Provide your own in id_dict.")
+    #         dictionaries[f'resid_{layer}'] = SAE.from_pretrained(
+    #             release.format(M='res'),
+    #             sae_id.format(L=(layer+1 if hook_resid_pre else layer))
+    #         )[0]
+    #     dictionaries['y'] = dictionaries[f'resid_{len(model.blocks)-1}']
+    # except KeyError:
+    #     raise ValueError(f"Residual SAE for the final layer must be provided.")
+    # TODO : remove that, just to check that it is never used.
+    # for k, v in dictionaries.items():
+    #     print(f"Normalizing activations for {k} with {v.cfg.normalize_activations}")
+    #     print(f"Apply fine tuning scaling factor for {k} with {v.cfg.finetuning_scaling_factor}")
 
-# TODO : delete the below functions after testing the new pipeline
+    for k in dictionaries:
+        dictionaries[k].to(name2mod[k].module.cfg.device)
 
-def __old_load_model_and_modules(device, unified=True, model_name="EleutherAI/pythia-70m-deduped"):
-    if unified:
-        model = UnifiedTransformer(
-            model_name,
-            device=device,
-            processing=False,
-        )
-        model.device = model.cfg.device
-        model.tokenizer.padding_side = 'left'
-
-        embed = model.embed
-
-        resids = []
-        attns = []
-        mlps = []
-        for layer in range(len(model.blocks)):
-            resids.append(model.blocks[layer])
-            attns.append(model.blocks[layer].attn)
-            mlps.append(model.blocks[layer].mlp)
-
-        submod_names = {
-            model.embed : 'embed'
-        }
-        for i in range(len(model.blocks)):
-            submod_names[model.blocks[i].attn] = f'attn_{i}'
-            submod_names[model.blocks[i].mlp] = f'mlp_{i}'
-            submod_names[model.blocks[i]] = f'resid_{i}'
-
-        return model, embed, resids, attns, mlps, submod_names
-    
-    else:
-        if model_name != "EleutherAI/pythia-70m-deduped":
-            raise NotImplementedError("Only EleutherAI/pythia-70m-deduped is supported for non-unified models.")
-        model = LanguageModel(
-            model_name,
-            device_map=device,
-            dispatch=True,
-        )
-
-        embed = model.gpt_neox.embed_in
-
-        resids = []
-        attns = []
-        mlps = []
-        for layer in range(len(model.gpt_neox.layers)):
-            resids.append(model.gpt_neox.layers[layer])
-            attns.append(model.gpt_neox.layers[layer].attention)
-            mlps.append(model.gpt_neox.layers[layer].mlp)
-
-        submod_names = {
-            model.gpt_neox.embed_in : 'embed'
-        }
-        for i in range(len(model.gpt_neox.layers)):
-            submod_names[model.gpt_neox.layers[i].attention] = f'attn_{i}'
-            submod_names[model.gpt_neox.layers[i].mlp] = f'mlp_{i}'
-            submod_names[model.gpt_neox.layers[i]] = f'resid_{i}'
-
-        return model, embed, resids, attns, mlps, submod_names
-
-def __old_load_saes(
-    model,
-    name2mod,
-    idd=False,
-    svd=False,
-    white=False,
-    device='cpu',
-    path='/scratch/pyllm/dhimoila/',
-    unified=True
-):
-    if white:
-        raise NotImplementedError("Whitening is not implemented yet.")
-    dictionaries = {}
-
-    d_model = 512
-    dict_size = 32768 if not svd else 512
-
-    if idd:
-        dictionaries[model_embed] = IdentityDict(d_model)
-        for layer in range(len(model.gpt_neox.layers if not unified else model.blocks)):
-            dictionaries[model_resids[layer]] = IdentityDict(d_model)
-            dictionaries[model_attns[layer]] = IdentityDict(d_model)
-            dictionaries[model_mlps[layer]] = IdentityDict(d_model)
-
-        return dictionaries
-    
-    path = path + "dictionaires/pythia-70m-deduped/"# + ("SVDdicts/" if svd else "")
-
-    if not svd:
-        ae = AutoEncoder(d_model, dict_size).to(device)
-        ae.load_state_dict(torch.load(path + f"embed/ae.pt", map_location=device))
-        dictionaries[model_embed] = ae
-    else:
-        d = torch.load(path + f"embed/cov.pt", map_location=device)
-        mean = d['mean']
-        cov = d['cov']
-        U, S, V = torch.svd(cov)
-        dictionaries[model_embed] = LinearDictionary(d_model, dict_size)
-        dictionaries[model_embed].E = V.T
-        dictionaries[model_embed].D = V
-        dictionaries[model_embed].bias = mean
-
-    for layer in range(len(model.gpt_neox.layers if not unified else model.blocks)):
-        
-        if not svd:
-            ae = AutoEncoder(d_model, dict_size).to(device)
-            ae.load_state_dict(torch.load(path + f"resid_out_layer{layer}/ae.pt", map_location=device))
-            dictionaries[model_resids[layer]] = ae
-        else:
-            d = torch.load(path + f"resid_out_layer{layer}/cov.pt", map_location=device)
-            mean = d['mean']
-            cov = d['cov']
-            U, S, V = torch.svd(cov) # cov is symmetric so U = V
-            dictionaries[model_resids[layer]] = LinearDictionary(d_model, dict_size)
-            dictionaries[model_resids[layer]].E = V.T
-            dictionaries[model_resids[layer]].D = V
-            dictionaries[model_resids[layer]].bias = mean
-        
-        if not svd:
-            ae = AutoEncoder(d_model, dict_size).to(device)
-            ae.load_state_dict(torch.load(path + f"attn_out_layer{layer}/ae.pt", map_location=device))
-            dictionaries[model_attns[layer]] = ae
-        else:
-            d = torch.load(path + f"attn_out_layer{layer}/cov.pt", map_location=device)
-            mean = d['mean']
-            cov = d['cov']
-            U, S, V = torch.svd(cov)
-            dictionaries[model_attns[layer]] = LinearDictionary(d_model, dict_size)
-            dictionaries[model_attns[layer]].E = V.T # This will perform the operation x @ E.T = x @ V, but V is in it's transposed form
-            dictionaries[model_attns[layer]].D = V
-            dictionaries[model_attns[layer]].bias = mean
-
-        if not svd:
-            ae = AutoEncoder(d_model, dict_size).to(device)
-            ae.load_state_dict(torch.load(path + f"mlp_out_layer{layer}/ae.pt", map_location=device))
-            dictionaries[model_mlps[layer]] = ae
-        else:
-            d = torch.load(path + f"mlp_out_layer{layer}/cov.pt", map_location=device)
-            mean = d['mean']
-            cov = d['cov']
-            U, S, V = torch.svd(cov)
-            dictionaries[model_mlps[layer]] = LinearDictionary(d_model, dict_size)
-            dictionaries[model_mlps[layer]].E = V.T
-            dictionaries[model_mlps[layer]].D = V
-            dictionaries[model_mlps[layer]].bias = mean
-    
     return dictionaries

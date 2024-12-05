@@ -335,7 +335,8 @@ def get_hidden_states(
                 x = x[0]
             
             if reconstruction_error:
-                x_hat, f = dictionary(x, output_features=True)
+                f = dictionary.encode(x)
+                x_hat = dictionary.decode(f)
                 hidden_states[submodule.name] = SparseAct(act=f.save(), res=(x - x_hat).save())
             else:
                 f = dictionary.encode(x)

@@ -111,7 +111,8 @@ def run_graph(
             )
             up_masked.act[:, :, mask[:-1]] = up_clean.act[:, :, mask[:-1]]
 
-            reconstructed_input += dictionaries[upstream].decode(up_masked.act) + up_masked.res
+            up_out = dictionaries[upstream].decode(up_masked.act) + up_masked.res
+            reconstructed_input += name2mod[upstream].LN_post.forward(up_out)
         return reconstructed_input
 
     hidden_states = {}
@@ -164,7 +165,7 @@ def run_graph(
 
             down_mod = name2mod[downstream]
 
-            ln = down_mod.LN.forward(reconstructed_input) if down_mod.LN is not None else reconstructed_input
+            ln = down_mod.LN_pre.forward(reconstructed_input)
             if 'attn' in downstream:
                 y = down_mod.module.forward(ln, ln, ln)
             elif 'mlp' in downstream:

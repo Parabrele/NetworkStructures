@@ -104,45 +104,26 @@ def faithfulness(
     with model.trace(clean):
         for fn_name, fn in metric_fn.items():
             results['complete'][fn_name] = fn(model, metric_fn_kwargs).save()
-
-    # get metric on fully ablated model
-    results['empty'] = {}
-    if patch is None: patch = clean
-
-    with model.trace(patch):
-        x = name2mod['y'].module.output
-        if type(x.shape) == tuple:
-            x = x[0]
-        x_hat, f = sae_dict['y'](x, output_features=True)
-        last_state = SparseAct(act=f, res=x - x_hat).save()
-    last_state = ablation_fn(last_state)
-    with model.trace(patch):
-        submodule = name2mod['y']
-        if isinstance(submodule.module.output, tuple):
-            submodule.module.output[0] = sae_dict['y'].decode(last_state.act) + last_state.res
-        else:
-            submodule.module.output = sae_dict['y'].decode(last_state.act) + last_state.res
-        
-        for fn_name, fn in metric_fn.items():
-            results['empty'][fn_name] = fn(model, metric_fn_kwargs).save()
     
     ##########
     # Loop over thresholds to run ablation
     ##########
 
     # get metric on thresholded graph
-    for i, threshold in enumerate(thresholds):
-        results[threshold] = {}
+    for i, threshold in enumerate([1e16] + thresholds):
+        if i != 0:
+            results[threshold] = {}
 
         mask = get_mask(circuit, threshold, threshold_on_nodes=node_ablation)
         if not node_ablation:
             mask = prune(mask)
 
-        if get_graph_info:
-            results[threshold]['n_nodes'] = get_n_nodes(mask)
-            results[threshold]['n_edges'] = get_n_edges((mask, architectural_graph) if node_ablation else mask)
-            results[threshold]['avg_deg'] = 2 * results[threshold]['n_edges'] / (results[threshold]['n_nodes'] if results[threshold]['n_nodes'] > 0 else 1)
-            results[threshold]['density'] = get_density((mask, architectural_graph) if node_ablation else mask)
+        if i != 0:
+            if get_graph_info:
+                results[threshold]['n_nodes'] = get_n_nodes(mask)
+                results[threshold]['n_edges'] = get_n_edges((mask, architectural_graph) if node_ablation else mask)
+                results[threshold]['avg_deg'] = 2 * results[threshold]['n_edges'] / (results[threshold]['n_nodes'] if results[threshold]['n_nodes'] > 0 else 1)
+                results[threshold]['density'] = get_density((mask, architectural_graph) if node_ablation else mask)
 
         # get dict metric_name -> metric_values
 
@@ -164,38 +145,34 @@ def faithfulness(
             run_graph_args['computational_graph'] = mask
 
         threshold_result = run_graph(**run_graph_args)
-        results[threshold]['faithfulness'] = {
-            k: v.value.mean().item() for k, v in threshold_result.items()
-        }
 
-        # print(f"Threshold {threshold} :")
-        for k in threshold_result:
-            g = threshold_result[k].value
-            m = results['complete'][k].value
-            e = results['empty'][k].value
-            faith = (g-e)/(m-e)
-            # print(f"\t{k} :")
-            # print(f"\t\tg : {g}")
-            # print(f"\t\tm : {m}")
-            # print(f"\t\te : {e}")
-            # print(f"\t\tfaith : {faith}")
-            faith = torch.where((m-e).abs() < 1e-6, torch.zeros_like(faith), faith)
-            # print(f"\t\tfaith post where : {faith}")
-            # print(f"\t\tfaith mean : {faith.mean()}")
-            results[threshold]['faithfulness']['faithfulness_' + k] = faith.mean().item()
+        if i == 0:
+            results['empty'] = threshold_result
+        else:
+            results[threshold]['faithfulness'] = {
+                k: v.value.mean().item() for k, v in threshold_result.items()
+            }
 
-        run_graph_args['complement'] = True
-        complement_result = run_graph(**run_graph_args)
-        results[threshold]['completeness'] = {
-            k: v.value.mean().item() for k, v in complement_result.items()
-        }
+            for k in threshold_result:
+                g = threshold_result[k].value
+                m = results['complete'][k].value
+                e = results['empty'][k].value
+                faith = (g-e)/(m-e)
+                faith = torch.where((m-e).abs() < 1e-6, torch.zeros_like(faith), faith)
+                results[threshold]['faithfulness']['faithfulness_' + k] = faith.mean().item()
 
-        for k in complement_result:
-            g = complement_result[k].value
-            m = results['complete'][k].value
-            e = results['empty'][k].value
-            faith = (g-e)/(m-e)
-            faith = torch.where((m-e).abs() < 1e-6, torch.zeros_like(faith), faith)
-            results[threshold]['completeness']['completeness_' + k] = faith.mean().item()
+            run_graph_args['complement'] = True
+            complement_result = run_graph(**run_graph_args)
+            results[threshold]['completeness'] = {
+                k: v.value.mean().item() for k, v in complement_result.items()
+            }
+
+            for k in complement_result:
+                g = complement_result[k].value
+                m = results['complete'][k].value
+                e = results['empty'][k].value
+                faith = (g-e)/(m-e)
+                faith = torch.where((m-e).abs() < 1e-6, torch.zeros_like(faith), faith)
+                results[threshold]['completeness']['completeness_' + k] = faith.mean().item()
 
     return results
