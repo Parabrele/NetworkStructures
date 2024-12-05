@@ -13,17 +13,30 @@ else:
     tracer_kwargs = {'validate' : False, 'scan' : False}
 
 def _get_edge_attr_feature(
-    model,
-    clean, hidden_states_clean, hidden_states_patch,
-    dictionaries,
-    downstream, # str : downstream module
-    upstreams, # list of str : modules upstream of downstream
-    name2mod, # dict str -> Submodule : name to module
-    features_by_submod,
-    is_tuple, steps,
-    edge_threshold,
-    metric_fn, metric_kwargs=dict(),
-):
+        model, # Unified transformer (from nnsight)
+               # model to interpret
+        clean, # Tokenized clean input
+        hidden_states_clean, # dict of str -> SparseAct
+                             # The hidden states in feature space.
+        hidden_states_patch, # dict of str -> SparseAct
+        dictionaries, # dict of str -> SAE
+                      # The feature dictionaries to use for the interpretation.
+                      # Should be at least one for every module appearing in the architecture graph.
+        downstream, # str : downstream module
+        upstreams, # list of str : modules upstream of downstream
+        name2mod, # dict str -> Submodule : name to module
+        features_by_submod, # dict of str -> list of int
+                            # Features of interest for each module.
+        is_tuple, # dict of str -> bool
+                  # Whether the module output is a tuple or not.
+        steps, # int. Number of steps for the integrated gradients.
+                  # When this value equals 1, only one gradient step is computed and the method is equivalent to
+                  # the Attribution Patching's paper method.
+        edge_threshold, # float. Threshold for pruning.
+        metric_fn, metric_kwargs=dict(), # dict
+                              # Additional arguments to pass to the metric function.
+                              # e.g. if the metric function is the logit, one should add the position of the target logit.
+    ):
     """
     Helper function for get_circuit_feature.
     Get the effect of some upstream modules on some downstream module. Uses integrated gradient attribution.
@@ -49,6 +62,9 @@ def _get_edge_attr_feature(
     downstream_submod = name2mod[downstream]
 
     # used for resid layers. If upstreams include the current layer's attn and mlp, do not do the full forward pass
+    # In that case, resid_{l+1} = attn_{l+1} + mlp_{l+1} + resid_{l} (or upstreams of resid_{l} if the current
+    #                                                                 settings do not include resid_{l}).
+    # Otherwise, resid_{l+1} = resid_{l}
     do_the_forward = True
     for up in upstreams:
         if up != 'embed' and not downstream == 'y':
@@ -58,11 +74,13 @@ def _get_edge_attr_feature(
                 do_the_forward = False
                 break
     
+    # dicts upstream_name -> downstream_feature -> effect_indices / effect_values
+    # Store information to create a sparse coo tensor storing the attribution of upstream -> downstream
     effect_indices = {}
     effect_values = {}
 
-    effect_indices = {}
-    effect_values = {}
+    # For all downstream feat, reconstruct the input, do a forward pass
+    # in the module, patch only the feature of interest, and compute the effect on the metric.
     for downstream_feat in downstream_features:
         metrics = []
         fs = {}
@@ -73,32 +91,34 @@ def _get_edge_attr_feature(
             reconstructed_input = 0
 
             for upstream_name in upstreams:
+                # get the hidden states of the upstream module in feature space
+                # Linearly interpolate between the clean and patched hidden states
                 upstream_act = alpha * hidden_states_clean[upstream_name] + (1-alpha) * hidden_states_patch[upstream_name] # act shape (batch_size, seq_len, n_features) res shape (batch_size, seq_len, d_model)
                 upstream_act.act = upstream_act.act.clone().detach()
                 upstream_act.act.requires_grad_().retain_grad()
                 upstream_act.res = upstream_act.res.clone().detach()
                 upstream_act.res.requires_grad_().retain_grad()
 
+                # Keep track of that state for later gradients
                 if fs.get(upstream_name) is None:
                     fs[upstream_name] = []
                 fs[upstream_name].append(upstream_act)
                 
+                # go back to latent space
                 up_out = dictionaries[upstream_name].decode(upstream_act.act) + upstream_act.res
+                # apply ln_post if needed (otherwise, this will be a torch.nn.Identity)
                 reconstructed_input += name2mod[upstream_name].LN_post.forward(up_out)
             
             if downstream != 'y':
-                # get the new output of the downstream module.
+                # get the output of the downstream module.
+                # Most of the times, attn and mlp are preceded by a LN layer.
+                # For modules without a preceding LN layer, this will be a torch.nn.Identity.
                 ln = downstream_submod.LN_pre.forward(reconstructed_input)
                 if 'attn' in downstream:
                     y = downstream_submod.module.forward(ln, ln, ln)
                 elif 'mlp' in downstream:
                     y = downstream_submod.module.forward(ln)
                 elif 'resid' in downstream:
-                    # If the current layer has a resid and it's respective attn & mlp, it is just the sum of the previous resid and both of those.
-                    # Otherwise, the input has to go through the whole transformer block.
-                    # This would be much easier if I could give an identity module to the submod class, but then I could not intervene
-                    # in the .output later on. To do that I would have to properly incorporate that identity module inside of the architecture of the
-                    # transformer so that nnsight knows how to deal with it.
                     if do_the_forward:
                         y = downstream_submod.module.forward(ln)
                     else:
@@ -107,6 +127,7 @@ def _get_edge_attr_feature(
                     raise ValueError(f"Downstream module {downstream} not recognized")
                 
                 # TODO : check that with autograd and all these interventions, the gradients are properly computed
+                # Go to feature space
                 g = dictionaries[downstream].encode(y)
                 y_hat = dictionaries[downstream].decode(g)
                 y_res = y - y_hat
@@ -115,10 +136,11 @@ def _get_edge_attr_feature(
                     res=y_res
                 )
                 
-                # Now, modify current feature in the downstream module's output and compute the effect on the metric
+                # In feature space, patch only the feature of interest before proceeding to the rest of the forward pass to get the effect on the metric.
                 # downstream_feat is the flattened index across sequence and features. Extract the feature index and the sequence index :
                 feat_idx = downstream_feat % (downstream_act.act.size(-1) + 1)
                 seq_idx = downstream_feat // (downstream_act.act.size(-1) + 1)
+                # deal with the reconstruction error node :
                 if feat_idx == downstream_act.act.size(-1):
                     diff = downstream_act.res[..., seq_idx, :] - hidden_states_clean[downstream].res[..., seq_idx, :]
                 else:
@@ -127,6 +149,7 @@ def _get_edge_attr_feature(
                     # Use this to scale the target feature vector
                     diff = diff * dictionaries[downstream].W_dec[feat_idx]
             
+                # Do the forward pass with that patch and get the effect on the metric
                 with model.trace(clean, **tracer_kwargs):
                     if is_tuple[downstream]:
                         downstream_submod.module.output[0][..., seq_idx, :] += diff # downstream_act - clean_states Remove the current feature's effect and add it's patched effect
@@ -135,14 +158,17 @@ def _get_edge_attr_feature(
 
                     metrics.append(metric_fn(model, metric_kwargs).save())
             
+            # If downstream == 'y', there is no "feature" of interest, only the whole output.
             else:
                 with model.trace(clean, **tracer_kwargs):
                     downstream_submod.module.output = reconstructed_input
                     metrics.append(metric_fn(model, metric_kwargs).save())
 
+        # Backward pass...
         metric = sum([m for m in metrics])
         metric.sum().backward(retain_graph=True)
 
+        # ... to get the effect as grad @ delta
         for upstream_name in upstreams:
             mean_act_grad = sum([f.act.grad for f in fs[upstream_name]]) / steps
             mean_res_grad = sum([f.res.grad for f in fs[upstream_name]]) / steps
@@ -156,6 +182,7 @@ def _get_edge_attr_feature(
 
             effect = (grad @ delta).abs().to_tensor().flatten()
 
+            # Store the effect as a sparse tensor
             effect_indices[upstream_name][downstream_feat] = torch.where(
                 effect.abs() > edge_threshold,
                 effect,
@@ -187,8 +214,6 @@ def _get_edge_attr_feature(
 
         potential_upstream_features = effect_indices[upstream_name][1] # list of indices
         
-        # TODO : use upstream_mask like in __old_get_effect :
-        # upstream_mask = nodes[upstream_name].to_tensor().flatten()[potential_upstream_features].abs() > node_threshold
         if features_by_submod.get(upstream_name) is None:
             features_by_submod[upstream_name] = potential_upstream_features.unique().tolist()
         else:
@@ -233,11 +258,9 @@ def get_circuit_feature(
                           # Ablation function used for integrated gradient. Applied to the patched hidden states.
                           # The results gives the baseline for the integrated gradients.
         aggregation='sum', # str
-                           # Method to aggregate the edge weights across sequence positions and batch elements.
+                           # Method to aggregate the weights across sequence positions and batch elements.
                            # Supported methods are 'sum' and 'max'.
-        threshold=0.01, # float. Threshold for edge pruning.
-                             # When all edges leaving a node have a weight below this threshold, the node is pruned
-                             # and the result is equivalent to the node being below the 'node_threshold'.
+        threshold=0.01, # float. Threshold for pruning.
         edge_circuit=True, # bool. Whether to compute edge attribution or node attribution.
         steps=10, # int. Number of steps for the integrated gradients.
                   # When this value equals 1, only one gradient step is computed and the method is equivalent to
@@ -313,7 +336,7 @@ def get_circuit_feature(
         return edges
     
     else:
-        # Do node attribution.
+        # Do classic node attribution.
         nodes = get_hidden_attr(
             model,
             all_submods,

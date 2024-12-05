@@ -9,56 +9,35 @@ from utils.graph_utils import get_mask, prune, get_n_nodes, get_n_edges, get_den
 
 @torch.no_grad()
 def faithfulness(
-        model,
-        name2mod,
-        sae_dict,
-        clean,
-        circuit,
-        architectural_graph,
-        thresholds,
-        metric_fn,
-        metric_fn_kwargs={},
-        patch=None,
-        ablation_fn=None,
-        default_ablation='mean',
-        get_graph_info=True,
-        node_ablation=False
+        model, # Unified transformer (from nnsight)
+               # model to interpret
+        name2mod, # dict str -> Submodule : name to module
+        sae_dict, # dict of str -> SAE
+                  # The feature dictionaries to use for the interpretation.
+                  # Should be at least one for every module appearing in the architecture graph.
+        clean, # Tokenized clean input
+        circuit, # Output of some graph construction function
+                 # Currently only get_circuit_feature is supported
+                 # Contains attribution scores for nodes or edges
+        architectural_graph, # dict of downstream -> upstream modules.
+                             # The architecture graph of model.
+                             # The sink is 'y' and all necessary modules and connections should be included in this graph.
+                             # In this dict, modules are represented by their names (str).
+        thresholds, # float or list of float to threshold `circuit`'s values.
+        metric_fn, # dict of str -> callable : scalar functions to evaluate the model
+        metric_fn_kwargs={}, # dict of additional arguments to pass to the metric function.
+        patch=None, # Tokenized patch input (optional)
+        ablation_fn=None, # callable
+                          # Ablation function used for integrated gradient. Applied to the patched hidden states.
+                          # The results gives the baseline for the integrated gradients.
+        default_ablation='mean', # str : default ablation function to use if patch is None
+        get_graph_info=True, # bool : whether to compute graph metrics (n_nodes, n_edges, avg_deg, density)
+        node_ablation=False # bool : whether `circuit` contains node or edge attributions.
     ):
     """
-    model : nnsight model
-    submodules : list of model submodules
-    sae_dict : dict
-        dict [submodule] -> SAE
-    name_dict : dict
-        dict [submodule] -> str
-    clean : str, list of str or tensor (batch, seq_len)
-        the input to the model
-    patch : None, str, list of str or tensor (batch, seq_len)
-        the counterfactual input to the model to ablate edges.
-        If None, ablation_fn is default to mean
-        Else, ablation_fn is default to identity
-    circuit : edges
-    thresholds : float or list of float
-        the thresholds to discard edges based on their weights
-    metric_fn : callable or dict name -> callable
-        the function(s) to evaluate the model.
-        It can be CE, accuracy, logit for target token, etc.
-    metric_fn_kwargs : dict
-        the kwargs to pass to metric_fn. E.g. target token.
-    ablation_fn : callable
-        the function used to get the patched states.
-        E.g. : mean ablation means across batch and sequence length or only across one of them.
-               zero ablation : patch states are just zeros
-               id ablation : patch states are computed from the patch input and left unchanged
-    default_ablation : str
-        the default ablation function to use if patch is None
-        Available : mean, zero
-        Mean is across batch and sequence length by default.
-
     returns a dict
-        threshold -> dict ('TODO:nedges/nnodes/avgdegre/anyothermetriconthegraph', 'metric', 'metric_comp', 'faithfulness', 'completeness')
-            -> float
-        'complete' -> float (metric on the original model)
+        threshold -> 'faithfulness'/'completeness' -> metric_name -> metric_value
+        'complete' -> metric_name -> float (metric on the original model)
         'empty' -> float (metric on the fully ablated model, no edges)
     """
     if isinstance(thresholds, float):
