@@ -15,6 +15,8 @@ import matplotlib
 
 from utils.graph_utils import to_graph
 
+print("The file evaluation/community.py is deprecated and should not be used anymore.")
+
 def cov2corr(cov):
     """
     Cov : covariance matrix

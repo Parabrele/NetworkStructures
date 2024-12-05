@@ -7,10 +7,6 @@ from utils.activation import SparseAct
 from utils.ablation_fns import mean_ablation, zero_ablation, id_ablation
 from utils.graph_utils import get_mask, prune, get_n_nodes, get_n_edges, get_density
 
-# TODO : instead of clean and patch, give the buffer, to not re threshold for each batch.
-# TODO : separate this function into one that computes metrics given a mask graph, and
-#        one that gather all evaluations, not only faithfulness
-
 @torch.no_grad()
 def faithfulness(
         model,

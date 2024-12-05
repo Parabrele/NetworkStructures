@@ -19,46 +19,6 @@ def topological_sort(graph):
 
     return list(nx.topological_sort(nx_graph))
 
-def merge_circuits(
-    tot_circuit,
-    circuit,
-    aggregation="max",
-):
-    if tot_circuit is None:
-        tot_circuit = circuit
-    else:
-        for k, v in circuit[0].items():
-            if v is not None:
-                if aggregation == "sum":
-                    tot_circuit[0][k] += v
-                elif aggregation == "max":
-                    if type(v) == SparseAct:
-                        tot_circuit[0][k] = SparseAct.maximum(tot_circuit[0][k], v)
-                    else:
-                        tot_circuit[0][k] = torch.maximum(tot_circuit[0][k], v)
-                else:
-                    raise ValueError(f"Unknown aggregation method {aggregation}")
-        for ku, vu in circuit[1].items():
-            for kd, vd in vu.items():
-                if vd is not None:
-                    if aggregation == "sum":
-                        tot_circuit[1][ku][kd] += vd
-                    elif aggregation == "max":
-                        tot_circuit[1][ku][kd] = sparse_coo_maximum(tot_circuit[1][ku][kd], vd)
-
-    return tot_circuit
-
-def mean_circuit(circuit, n):
-    for k, v in circuit[0].items():
-        if v is not None:
-            circuit[0][k] /= n
-    for ku, vu in circuit[1].items():
-        for kd, vd in vu.items():
-            if vd is not None:
-                circuit[1][ku][kd] /= n
-
-    return circuit
-
 @torch.no_grad()
 def get_mask(graph, threshold, threshold_on_nodes=False):
     """
@@ -100,68 +60,6 @@ def get_mask(graph, threshold, threshold_on_nodes=False):
                     )
         return edge_mask
 
-@torch.no_grad()
-def to_Digraph(circuit, discard_res=False, discard_y=False):
-    """
-    circuit : tuple (nodes, edges), dict or nk.Graph
-    returns a networkx DiGraph
-    """
-    if isinstance(circuit, nx.DiGraph):
-        return circuit
-    # elif isinstance(circuit, nk.Graph):
-    #     return nk.nxadapter.nk2nx(circuit)
-    elif isinstance(circuit, tuple) or isinstance(circuit, dict):
-        G = nx.DiGraph()
-
-        if isinstance(circuit, tuple):
-            nodes, edges = circuit
-        else:
-            edges = circuit
-
-        for upstream in edges:
-            for downstream in edges[upstream]:
-                if downstream == 'y':
-                    if discard_y:
-                        continue
-                    else:
-                        for u in edges[upstream][downstream].coalesce().indices().t():
-                            u = u.item()
-                            if discard_res and u == edges[upstream][downstream].size(0) - 1:
-                                continue
-                            upstream_name = f"{upstream}_{u}"
-                            G.add_edge(upstream_name, downstream, weight=edges[upstream][downstream][u].item())
-                        continue
-                for d, u in edges[upstream][downstream].coalesce().indices().t():
-                    d = d.item()
-                    u = u.item()
-                    # this weight matrix has shape (f_down + 1, f_up + 1)
-                    # reconstruction error nodes are the last ones
-                    if discard_res and (
-                        d == edges[upstream][downstream].size(0) - 1
-                        or u == edges[upstream][downstream].size(1) - 1
-                    ):
-                        continue
-                    
-                    upstream_name = f"{upstream}_{u}"
-                    downstream_name = f"{downstream}_{d}"
-                    G.add_edge(upstream_name, downstream_name, weight=edges[upstream][downstream][d, u].item())
-
-        return G
-
-def to_graph(circuit, discard_res=False, discard_y=False):
-    """
-    return a networkx undirected graph
-    """
-    graph = to_Digraph(circuit, discard_res=discard_res, discard_y=discard_y)
-    return graph.to_undirected()
-
-def to_tuple(G):
-    """
-    G : nx.DiGraph or nk.Graph
-    returns a tuple (nodes, edges)
-    """
-    raise NotImplementedError
-
 def prune(
     circuit
 ):
@@ -175,16 +73,6 @@ def prune(
         return prune_nx(circuit)
     else:
         return prune_sparse_coos(circuit)
-
-def __old_reorder_upstream(edges):
-    """
-    edges : dict of dict of sparse_coo tensors
-    returns a dict of dict of sparse_coo tensors
-    """
-    new_edges = {}
-    for up in reversed(list(edges.keys())):
-        new_edges[up] = edges[up]
-    return new_edges
 
 def coalesce_edges(edges):
     """
@@ -427,18 +315,6 @@ def get_n_edges(G):
     else :
         raise ValueError("Unknown graph type")
 
-def get_avg_degree(G):
-    return 2 * G.number_of_edges() / G.number_of_nodes()
-
-def get_connected_components(G):
-    if isinstance(G, nx.DiGraph):
-        G = G.to_undirected()
-
-    G = G.copy()
-    G.remove_node('y')
-
-    return nx.number_connected_components(G)
-
 def get_density(edges):
     # edges is a dict of dict of sparse_coo tensors
     if edges is None:
@@ -461,6 +337,3 @@ def get_density(edges):
             max_edges += n_up * n_down
     max_edges = max(max_edges, 1)
     return n_edges / max_edges
-
-def get_degree_distribution(G):
-    return nx.degree_histogram(G)

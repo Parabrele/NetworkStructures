@@ -1,13 +1,9 @@
-import torch as t
-from argparse import ArgumentParser
-from nnsight import LanguageModel
+import torch
 
-from utils.dictionary import AutoEncoder, IdentityDict
-
-from utils.activation import SparseAct, get_hidden_states, get_is_tuple
+from utils.activation import get_hidden_states, get_is_tuple
 from utils.graph_utils import topological_sort
 
-@t.no_grad()
+@torch.no_grad()
 def run_graph(
         model,
         architectural_graph,
@@ -44,7 +40,7 @@ def run_graph(
 
     topological_order = topological_sort(architectural_graph)
     
-    with model.trace(clean), t.no_grad():
+    with model.trace(clean), torch.no_grad():
         for submod in topological_order:
             if submod == 'y': continue
             dictionary = dictionaries[submod]

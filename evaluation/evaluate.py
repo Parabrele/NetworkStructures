@@ -1,2 +1,0 @@
-def evaluate():
-    raise NotImplementedError()

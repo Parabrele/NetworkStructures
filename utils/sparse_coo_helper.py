@@ -193,7 +193,6 @@ def update_frequency(freq, data, is_node=False, threshold=0.0):
                         if freq.get(upstream) is None:
                             freq[upstream] = t.zeros(shape, dtype=t.int64, device=w.device)
                         freq[upstream][idx] += 1
-                    
 
 def aggregate_nodes(nodes, aggregation='sum', freq=None, threshold=0.0):
     if aggregation == 'sum':

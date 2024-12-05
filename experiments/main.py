@@ -76,7 +76,7 @@ from evaluation.faithfulness import faithfulness as faithfulness_fn
 from data.buffer import single_input_buffer, wikipedia_buffer, gp_buffer, gt_buffer, ioi_buffer, bool_buffer, mixture_buffer, unpack_batch, rc_buffer, simple_rc_buffer
 
 from utils.ablation_fns import zero_ablation, mean_ablation, id_ablation
-from utils.savior import save_circuit
+from utils.utils import save_circuit
 from utils.plotting import plot_faithfulness
 from utils.metric_fns import metric_fn_logit, metric_fn_KL, metric_fn_statistical_distance, metric_fn_acc, metric_fn_MRR
 from utils.experiments_setup import load_model_and_modules, load_saes, get_architectural_graph

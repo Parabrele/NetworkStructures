@@ -1,164 +1,212 @@
-import gc
+import torch
 
-import torch as t
-from tqdm import tqdm
-
-from connectivity.attribution import y_effect, __old_get_effect, get_edge_attr_feature
-from utils.activation import get_is_tuple, get_hidden_states, get_hidden_attr
+from utils.activation import SparseAct, get_is_tuple, get_hidden_states, get_hidden_attr
 from utils.sparse_coo_helper import rearrange_weights, aggregate_weights, aggregate_nodes
 from utils.graph_utils import topological_sort
 from utils.ablation_fns import id_ablation
 
-def get_circuit(
-    clean,
-    patch,
+DEBUGGING = False
+
+if DEBUGGING:
+    tracer_kwargs = {'validate' : True, 'scan' : True}
+else:
+    tracer_kwargs = {'validate' : False, 'scan' : False}
+
+def _get_edge_attr_feature(
     model,
+    clean, hidden_states_clean, hidden_states_patch,
     dictionaries,
-    metric_fn,
-    embed,
-    resids,
-    attns=None,
-    mlps=None,
-    metric_kwargs=dict(),
-    ablation_fn=None,
-    aggregation='sum', # or 'none' for not aggregating across sequence position
-    node_threshold=0.1,
-    edge_threshold=0.01,
-    steps=10,
-    nodes_only=False,
-    dump_all=False,
-    save_path=None,
+    downstream, # str : downstream module
+    upstreams, # list of str : modules upstream of downstream
+    name2mod, # dict str -> Submodule : name to module
+    features_by_submod,
+    is_tuple, steps,
+    edge_threshold,
+    metric_fn, metric_kwargs=dict(),
 ):
-    return __old__get_circuit_feature_resid_only(
-        clean,
-        patch,
-        model,
-        embed,
-        resids,
-        dictionaries,
-        metric_fn,
-        metric_kwargs=metric_kwargs,
-        ablation_fn=ablation_fn,
-        normalise_edges=False, # old test, not used anymore
-        use_start_at_layer=False,
-        aggregation=aggregation,
-        node_threshold=node_threshold,
-        edge_threshold=edge_threshold,
-        nodes_only=nodes_only,
-        steps=steps,
-        dump_all=dump_all,
-        save_path=save_path,
-    )
+    """
+    Helper function for get_circuit_feature.
+    Get the effect of some upstream modules on some downstream module. Uses integrated gradient attribution.
+    Do not support feature partitions (ROIs). See get_edge_attr_roi for that.
+    """
+    try:
+        downstream_features = features_by_submod[downstream]
+    except KeyError:
+        raise ValueError(f"Module {downstream} has no features to compute effects for")
 
-# TODO : remove this function. Should be a special case of get_circuit_feature
-def __old__get_circuit_feature_resid_only(
-        clean,
-        patch,
-        model,
-        embed,
-        resids,
-        dictionaries,
-        metric_fn,
-        metric_kwargs=dict(),
-        ablation_fn=None,
-        normalise_edges=False, # whether to divide the edges entering a node by their sum
-        use_start_at_layer=False, # Whether to compute the layer-wise effects with the start at layer argument to save computation
-        aggregation='max', # or 'none' for not aggregating across sequence position
-        node_threshold=0.1,
-        edge_threshold=0.01,
-        nodes_only=False,
-        steps=10,
-        dump_all=False,
-        save_path=None,
-):
-    if dump_all and save_path is None:
-        raise ValueError("If dump_all is True, save_path must be provided.")
-    
-    all_submods = [embed] + [submod for submod in resids]
-    last_layer = resids[-1]
-    n_layers = len(resids)
-    
-    # get the shape of the hidden states
-    is_tuple = get_is_tuple(model, all_submods)
+    if hasattr(model, 'device'):
+        device = model.device
+    elif hasattr(model, 'cfg'):
+        device = model.cfg.device
+    else:
+        raise ValueError("Can't get model device :c")
 
-    if use_start_at_layer:
-        raise NotImplementedError
-    
-    # get encoding and reconstruction errors for clean and patch
-    hidden_states_clean = get_hidden_states(model, submods=all_submods, dictionaries=dictionaries, is_tuple=is_tuple, input=clean)
+    #print(f"Computing effects for layer {layer} with {len(downstream_features)} features")
 
-    if patch is None:
-        patch = clean
+    if not features_by_submod[downstream]: # handle empty list
+        raise ValueError(f"Module {downstream} has no features to compute effects for")
     
-    hidden_states_patch = get_hidden_states(model, submods=all_submods, dictionaries=dictionaries, is_tuple=is_tuple, input=patch)
-    hidden_states_patch = {k : ablation_fn(v) for k, v in hidden_states_patch.items()}
+    downstream_submod = name2mod[downstream]
+
+    # used for resid layers. If upstreams include the current layer's attn and mlp, do not do the full forward pass
+    do_the_forward = True
+    for up in upstreams:
+        if up != 'embed' and not downstream == 'y':
+            u_typ, u_l = up.split('_')
+            d_typ, d_l = downstream.split('_')
+            if u_l == d_l:
+                do_the_forward = False
+                break
     
-    features_by_submod = {}
+    effect_indices = {}
+    effect_values = {}
 
-    # start by the effect of the last layer to the metric
-    edge_effect, nodes_attr = y_effect(
-        model,
-        clean, hidden_states_clean, hidden_states_patch,
-        last_layer, all_submods,
-        dictionaries, is_tuple,
-        steps, metric_fn, metric_kwargs,
-        normalise_edges, node_threshold, edge_threshold,
-        features_by_submod
-    )
-    nodes = {}
-    # print(f'resid_{len(resids)-1}')
-    nodes[f'resid_{len(resids)-1}'] = nodes_attr[last_layer]
+    effect_indices = {}
+    effect_values = {}
+    for downstream_feat in downstream_features:
+        metrics = []
+        fs = {}
 
-    if nodes_only:
-        for layer in reversed(range(n_layers)):
-            if layer > 0:
-                # print(f'resid_{layer-1}')
-                nodes[f'resid_{layer-1}'] = nodes_attr[resids[layer-1]]
+        for step in range(1, steps+1):
+            alpha = step / steps
+
+            reconstructed_input = 0
+
+            for upstream_name in upstreams:
+                upstream_act = alpha * hidden_states_clean[upstream_name] + (1-alpha) * hidden_states_patch[upstream_name] # act shape (batch_size, seq_len, n_features) res shape (batch_size, seq_len, d_model)
+                upstream_act.act = upstream_act.act.clone().detach()
+                upstream_act.act.requires_grad_().retain_grad()
+                upstream_act.res = upstream_act.res.clone().detach()
+                upstream_act.res.requires_grad_().retain_grad()
+
+                if fs.get(upstream_name) is None:
+                    fs[upstream_name] = []
+                fs[upstream_name].append(upstream_act)
+                
+                up_out = dictionaries[upstream_name].decode(upstream_act.act) + upstream_act.res
+                reconstructed_input += name2mod[upstream_name].LN_post.forward(up_out)
+            
+            if downstream != 'y':
+                # get the new output of the downstream module.
+                ln = downstream_submod.LN_pre.forward(reconstructed_input)
+                if 'attn' in downstream:
+                    y = downstream_submod.module.forward(ln, ln, ln)
+                elif 'mlp' in downstream:
+                    y = downstream_submod.module.forward(ln)
+                elif 'resid' in downstream:
+                    # If the current layer has a resid and it's respective attn & mlp, it is just the sum of the previous resid and both of those.
+                    # Otherwise, the input has to go through the whole transformer block.
+                    # This would be much easier if I could give an identity module to the submod class, but then I could not intervene
+                    # in the .output later on. To do that I would have to properly incorporate that identity module inside of the architecture of the
+                    # transformer so that nnsight knows how to deal with it.
+                    if do_the_forward:
+                        y = downstream_submod.module.forward(ln)
+                    else:
+                        y = ln
+                else:
+                    raise ValueError(f"Downstream module {downstream} not recognized")
+                
+                # TODO : check that with autograd and all these interventions, the gradients are properly computed
+                g = dictionaries[downstream].encode(y)
+                y_hat = dictionaries[downstream].decode(g)
+                y_res = y - y_hat
+                downstream_act = SparseAct(
+                    act=g,
+                    res=y_res
+                )
+                
+                # Now, modify current feature in the downstream module's output and compute the effect on the metric
+                # downstream_feat is the flattened index across sequence and features. Extract the feature index and the sequence index :
+                feat_idx = downstream_feat % (downstream_act.act.size(-1) + 1)
+                seq_idx = downstream_feat // (downstream_act.act.size(-1) + 1)
+                if feat_idx == downstream_act.act.size(-1):
+                    diff = downstream_act.res[..., seq_idx, :] - hidden_states_clean[downstream].res[..., seq_idx, :]
+                else:
+                    # Get the scalar value (coeff) of the downstream feature
+                    diff = downstream_act.act[..., seq_idx, feat_idx] - hidden_states_clean[downstream].act[..., seq_idx, feat_idx]
+                    # Use this to scale the target feature vector
+                    diff = diff * dictionaries[downstream].W_dec[feat_idx]
+            
+                with model.trace(clean, **tracer_kwargs):
+                    if is_tuple[downstream]:
+                        downstream_submod.module.output[0][..., seq_idx, :] += diff # downstream_act - clean_states Remove the current feature's effect and add it's patched effect
+                    else:
+                        downstream_submod.module.output[..., seq_idx, :] += diff
+
+                    metrics.append(metric_fn(model, metric_kwargs).save())
+            
             else:
-                # print('embed')
-                nodes['embed'] = nodes_attr[embed]
+                with model.trace(clean, **tracer_kwargs):
+                    downstream_submod.module.output = reconstructed_input
+                    metrics.append(metric_fn(model, metric_kwargs).save())
 
-        print(nodes.keys())
-        return nodes, {}
-    
-    edges = {}
-    edges[f'resid_{len(resids)-1}'] = {'y' : edge_effect}
-    
-    # Now, backward through the model to get the effects of each layer on its successor.
-    for layer in reversed(range(n_layers)):
-        # print("Layer", layer, "threshold", edge_threshold)
-        # print("Number of downstream features:", len(features_by_submod[resids[layer]]))
+        metric = sum([m for m in metrics])
+        metric.sum().backward(retain_graph=True)
+
+        for upstream_name in upstreams:
+            mean_act_grad = sum([f.act.grad for f in fs[upstream_name]]) / steps
+            mean_res_grad = sum([f.res.grad for f in fs[upstream_name]]) / steps
+
+            grad = SparseAct(act=mean_act_grad, res=mean_res_grad)
+            delta = (hidden_states_patch[upstream_name] - hidden_states_clean[upstream_name]).detach()
+
+            if effect_indices.get(upstream_name) is None:
+                effect_indices[upstream_name] = {}
+                effect_values[upstream_name] = {}
+
+            effect = (grad @ delta).abs().to_tensor().flatten()
+
+            effect_indices[upstream_name][downstream_feat] = torch.where(
+                effect.abs() > edge_threshold,
+                effect,
+                torch.zeros_like(effect)
+            ).nonzero().squeeze(-1)
+
+            effect_values[upstream_name][downstream_feat] = effect[effect_indices[upstream_name][downstream_feat]]
+
+    # get shapes for the return sparse tensors
+    d_downstream_contracted = torch.tensor(hidden_states_clean[downstream].act.size() if downstream != 'y' else (0,)) # if downstream == 'y', then the output is a single scalar
+    d_downstream_contracted[-1] += 1
+    d_downstream_contracted = d_downstream_contracted.prod()
+
+    d_upstream_contracted = {}
+    for upstream_name in upstreams:
+        d_upstream_contracted[upstream_name] = torch.tensor(hidden_states_clean[upstream_name].act.size())
+        d_upstream_contracted[upstream_name][-1] += 1
+        d_upstream_contracted[upstream_name] = d_upstream_contracted[upstream_name].prod()
+
+    # Create the sparse_coo_tensor containing the effect of each upstream module on the downstream module
+    effects = {}
+    for upstream_name in upstreams:
+        # converts the dictionary of indices to a tensor of indices
+        effect_indices[upstream_name] = torch.tensor(
+            [[downstream_feat for downstream_feat in downstream_features for _ in effect_indices[upstream_name][downstream_feat]],
+            torch.cat([effect_indices[upstream_name][downstream_feat] for downstream_feat in downstream_features], dim=0)]
+        ).to(device).long()
+        effect_values[upstream_name] = torch.cat([effect_values[upstream_name][downstream_feat] for downstream_feat in downstream_features], dim=0)
+
+        potential_upstream_features = effect_indices[upstream_name][1] # list of indices
         
-        resid = resids[layer]
-        if layer > 0:
-            prev_resid = resids[layer-1]
+        # TODO : use upstream_mask like in __old_get_effect :
+        # upstream_mask = nodes[upstream_name].to_tensor().flatten()[potential_upstream_features].abs() > node_threshold
+        if features_by_submod.get(upstream_name) is None:
+            features_by_submod[upstream_name] = potential_upstream_features.unique().tolist()
         else:
-            prev_resid = embed
+            features_by_submod[upstream_name] += potential_upstream_features.unique().tolist()
+            features_by_submod[upstream_name] = list(set(features_by_submod[upstream_name]))
 
-        RR_effect = __old_get_effect(
-            model,
-            clean, hidden_states_clean, hidden_states_patch,
-            dictionaries,
-            layer, prev_resid, resid,
-            features_by_submod,
-            is_tuple, steps, normalise_edges,
-            nodes_attr, node_threshold, edge_threshold,
+        effects[upstream_name] = torch.sparse_coo_tensor(
+            effect_indices[upstream_name], effect_values[upstream_name],
+            (d_downstream_contracted, d_upstream_contracted[upstream_name])
         )
-    
-        if layer > 0:
-            nodes[f'resid_{layer-1}'] = nodes_attr[prev_resid]
-            edges[f'resid_{layer-1}'][f'resid_{layer}'] = RR_effect
-        else:
-            nodes['embed'] = nodes_attr[prev_resid]
-            edges['embed'][f'resid_0'] = RR_effect
-        
-        gc.collect()
-        t.cuda.empty_cache()
 
-    rearrange_weights(nodes, edges)
-    aggregate_weights(nodes, edges, aggregation, dump_all=dump_all, save_path=save_path)
+    return effects
 
-    return nodes, edges
+def _get_edge_attr_roi():
+    """
+    Helper function for get_circuit_roi.
+    """
+    pass
 
 def get_circuit_feature(
         clean, # Tokenized clean input
@@ -197,8 +245,7 @@ def get_circuit_feature(
         freq=None, # dict. Frequency of feature usage in the circuit.
 ):
     """
-    When feature dictionaries are not partitioned (~ endowed with the discrete partition)
-    it would be stupid to actually consider the discrete partition. This implementation is faster.
+    Run circuit discovery at feature level.
     """
     # gather all modules involved in the computation : start from 'y' and do a reachability search.
     visited = set()
@@ -244,7 +291,7 @@ def get_circuit_feature(
             if upstreams == [] or upstreams is None:
                 continue
 
-            edges[downstream] = get_edge_attr_feature(
+            edges[downstream] = _get_edge_attr_feature(
                 model,
                 clean, hidden_states_clean, hidden_states_patch,
                 dictionaries,
