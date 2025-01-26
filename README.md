@@ -17,6 +17,8 @@ To run forward passes with interventions, see the `ablation` folder.
 
 To evaluate the graph, see the `evaluation` folder.
 
+See the [minimal_example.ipynb](minimal_example.ipynb) notebook for a quick start.
+
 ## Data
 
 Contains functions to load various datasets, general or task specific.
