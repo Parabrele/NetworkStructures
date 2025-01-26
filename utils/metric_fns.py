@@ -25,13 +25,14 @@ def metric_fn_logit(model, kwargs={}):
     n_pos = 0
     neg = 0
     n_neg = 0
+    # TODO : if isinstance list, mean per sequence and then mean again.
     if trg_pos is not None:
         if isinstance(trg_pos, torch.Tensor):
             n_pos = trg_pos.numel()
             pos += logits[trg_pos]
         elif isinstance(trg_pos, list):
             for i, tokens in enumerate(trg_pos):
-                n_pos += 1
+                n_pos += len(tokens)
                 pos += logits[i, tokens].sum()
     if trg_neg is not None:
         if isinstance(trg_neg, torch.Tensor):
@@ -39,7 +40,7 @@ def metric_fn_logit(model, kwargs={}):
             neg += logits[trg_neg]
         elif isinstance(trg_neg, list):
             for i, tokens in enumerate(trg_neg):
-                n_neg += 1
+                n_neg += len(tokens)
                 neg += logits[i, tokens].sum()
     res = pos / max(n_pos, 1) - neg / max(n_neg, 1)
     return res

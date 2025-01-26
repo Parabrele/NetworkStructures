@@ -168,3 +168,5 @@ data/datasets/*
 data/runs/*
 *.out
 *.err
+
+*.pyc

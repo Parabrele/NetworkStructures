@@ -36,6 +36,7 @@ def _get_edge_attr_feature(
         metric_fn, metric_kwargs=dict(), # dict
                               # Additional arguments to pass to the metric function.
                               # e.g. if the metric function is the logit, one should add the position of the target logit.
+        restriction=None, # dict of str -> bool SparseAct. Restriction on the features to consider for each module. If None, all features are considered.
     ):
     """
     Helper function for get_circuit_feature.
@@ -189,6 +190,14 @@ def _get_edge_attr_feature(
                 torch.zeros_like(effect)
             ).nonzero().squeeze(-1)
 
+            # Restrict indices to available features :
+            if restriction is not None:
+                print(restriction[upstream_name].act.size())
+                raise NotImplementedError("Restriction not implemented yet")
+                mask = restriction[upstream_name].to_tensor() # (n_features + 1)
+                temp = effect_indices[upstream_name][downstream_feat]
+                effect_indices[upstream_name][downstream_feat] = temp[mask[temp % mask.size(0)]]
+
             effect_values[upstream_name][downstream_feat] = effect[effect_indices[upstream_name][downstream_feat]]
 
     # get shapes for the return sparse tensors
@@ -265,6 +274,7 @@ def get_circuit_feature(
         steps=10, # int. Number of steps for the integrated gradients.
                   # When this value equals 1, only one gradient step is computed and the method is equivalent to
                   # the Attribution Patching's paper method.
+        restriction=None, # dict of str -> bool SparseAct. Restriction on the features to consider for each module. If None, all features are considered.
         freq=None, # dict. Frequency of feature usage in the circuit.
 ):
     """
@@ -325,6 +335,7 @@ def get_circuit_feature(
                 is_tuple, steps,
                 threshold,
                 metric_fn, metric_kwargs=metric_kwargs,
+                restriction=restriction,
             ) # return a dict of upstream -> effect
         
         # Now, aggregate the weights across sequence positions and batch elements.

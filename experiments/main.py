@@ -2,6 +2,7 @@
 
 cd ~/NetworkStructures/
 python -m experiments.main --model gpt2 --start_at_layer 4 --local --node_circuit &
+python -m experiments.main --start_at_layer 2 --dataset gt --node_circuit &
 
 Local experiments :
     For all x in X :
@@ -26,6 +27,9 @@ Global experiments :
 # Get arguments from the command line
 ##########
 
+# TODO : save final circuit for given faithfulness
+# TODO : restrict edge circuits to a subset of nodes found by node circuits
+# TODO : mixture task
 # TODO : test freq
 
 from argparse import ArgumentParser
@@ -41,7 +45,7 @@ parser.add_argument("--dataset", type=str, default="simple_rc")
 parser.add_argument("--batch_size", type=int, default=1)
 parser.add_argument("--eval_batch_size", type=int, default=100)
 
-parser.add_argument("--model", type=str, default="EleutherAI/pythia-70m-deduped")
+parser.add_argument("--model", type=str, default="pythia-70m-deduped")
 
 parser.add_argument("--node_circuit", action="store_true", default=False)
 parser.add_argument("--threshold", type=float, default=1e-4)
@@ -118,11 +122,6 @@ if args.dataset == "ioi":
     tot_elts = 1000
     n_elts = 200
     n_tests = 200
-elif args.dataset == "mixture":
-    DATASET = mixture_buffer
-    tot_elts = 3000
-    n_elts = 600
-    n_tests = 600
 elif args.dataset == "simple_rc":
     DATASET = simple_rc_buffer
     tot_elts = 400
@@ -130,6 +129,21 @@ elif args.dataset == "simple_rc":
     n_tests = 200
 elif args.dataset == "rc":
     DATASET = rc_buffer
+    tot_elts = 400
+    n_elts = 200
+    n_tests = 200
+elif args.dataset == "gp":
+    DATASET = gp_buffer
+    tot_elts = 600
+    n_elts = 200
+    n_tests = 200
+elif args.dataset == "gt":
+    DATASET = gt_buffer
+    tot_elts = 600
+    n_elts = 200
+    n_tests = 200
+elif args.dataset == "mixture":
+    DATASET = mixture_buffer
     tot_elts = 400
     n_elts = 200
     n_tests = 200

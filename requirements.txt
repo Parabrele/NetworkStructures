@@ -12,3 +12,4 @@ pip install networkit
 pip install plotly
 pip install graphviz
 pip install transformer-lens
+pip install sae-lens

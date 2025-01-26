@@ -7,15 +7,18 @@ from sae_lens import SAE
 from utils.utils import Submod
 from utils.dictionary import IdentityDict
 
+# TODO : load model with from_pretrained_no_processing(..., **cfg.model_from_pretrained_kwargs)"
+
 model_name_to_processing = {
     "pythia-70m-deduped" : False,
     "gpt2" : True,
+    "gemma-2-2b" : False,
 }
 
 model_name_to_sae_release = {
     "pythia-70m-deduped" : "pythia-70m-deduped-{M}-sm",
     "gpt2" : "gpt2-small-{M}-jb",
-    "gemma-2-2b" : "gemma-scope-2b-pt-{M}",
+    "gemma-2-2b" : "gemma-scope-2b-pt-{M}-canonical",
 }
 
 model_hook_resid_pre = {

@@ -1,4 +1,7 @@
+just a draft containing random thoughts and todos. Most of them are already outdated.
+
 ## URGENT :
+- in load_saes, load them on model's layer's device
 - Look into pre/post ln : e.g. gemma seems to use ln(module(ln(resid))). More generally consider that SAEs might be attached to different points.
     - When loading Gemma SAEs, do E <- E * O^-1 and D <- D * O
         - What about when O is not invertible ?
@@ -16,15 +19,7 @@
     - save ROIs
 
 ## getting the graphs :
-- for downstream = y, also consider arbitrary connections.
-- for input gradient computation, to only consider direct paths, use a copy of the input vectors
-- step = 1 : AtP (donc ] 0 -> x ] et pas [0 -> x [), step = 10 : IG
-- node and edge attribution for any architecture
 - support ROIs as nodes
-
-## running the graphs :
-- Fix edge ablation error propagation nodes always present
-- node and edge ablation for any module dictionaries
 
 ## evaluating the graphs :
 - metric & faithfulness for
@@ -34,8 +29,8 @@
 
 ## node vs edge :
 - replicate marks debias bias in bios
-- maybe do a mixture of tasks : circuit for both gender and job determination, ablate gender node
-- show model unable to use gender : the entire node responsible for gender is gone
+- maybe do a mixture of tasks : circuit for both gender and job classification, ablate gender node
+- show model unable to use gender : the node responsible for gender is gone
 - do edge ablation instead
 - show model still able to use gender : the node is still there but not connected to one specific task.
 
@@ -78,3 +73,4 @@ Sparsity of SAEs : this might not be required as only a small number of features
     - for node/edge ablation : with clean, patch/baseline and patch forwards
     - for attribution : forward pass with only relevant edges impacted
 - if no embed SAE : do get_circuit with a graph that excludes embed, then for inference manually set the embed SAE to Identity and all edges 1... Not satisfying : later layer likely do not use the original embeding informations. Alternatively, start with a resid SAE from layer 0 (skip layer 1).
+

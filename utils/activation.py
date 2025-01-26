@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import torch as t
-from torchtyping import TensorType
 
 class SparseAct():
     """
@@ -14,9 +13,9 @@ class SparseAct():
 
     def __init__(
             self, 
-            act: TensorType["batch_size", "n_ctx", "d_dictionary"] = None, 
-            res: TensorType["batch_size", "n_ctx", "d_model"] = None,
-            resc: TensorType["batch_size", "n_ctx"] = None, # contracted residual
+            act, #: TensorType["batch_size", "n_ctx", "d_dictionary"] = None, 
+            res, #: TensorType["batch_size", "n_ctx", "d_model"] = None,
+            resc, #: TensorType["batch_size", "n_ctx"] = None, # contracted residual
             ) -> None:
 
             self.act = act

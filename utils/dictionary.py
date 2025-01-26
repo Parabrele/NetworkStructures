@@ -8,6 +8,8 @@ import torch.nn as nn
 
 from fancy_einsum import einsum
 
+from sae_lens import SAE, SAEConfig
+
 class Dictionary(ABC):
     """
     A dictionary consists of a collection of vectors, an encoder, and a decoder.
@@ -138,3 +140,26 @@ class LinearHeadDict(Dictionary, nn.Module):
             return x_hat, f
         else:
             return x_hat
+
+class SmallSAE(SAE):
+    """
+    A small SAE, with dead neurons explicitely absent.
+    """
+    def __init__(
+        self,
+        cfg: SAEConfig,
+        dead_idx: t.Tensor,
+        use_error_term: bool = False,
+    ):
+        super().__init__(cfg, use_error_term)
+        self.dead_idx = dead_idx
+
+        # self.W_enc : d_in x d_sae
+        # self.W_dec : d_sae x d_out
+        # self.b_enc : d_sae
+        # self.b_dec : d_in
+    
+    def f
+
+    def forward(self, x):
+        #sel

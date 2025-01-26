@@ -25,9 +25,9 @@ def parse_args():
     parser.add_argument("--out-path", "-o", default="/home/pyllm/dhimoila/feature-circuits-1/data/datasets/gt/")
     parser.add_argument("--tokenizer", "-t", default="gpt2")
     parser.add_argument("--use-only-original-template", "-u", action="store_true")
-    parser.add_argument("--train", "-tr", default=200)
-    parser.add_argument("--validation", "-va", default=200)
-    parser.add_argument("--test", "-tt", default=5000)
+    parser.add_argument("--train", "-tr", default=200, type=int)
+    parser.add_argument("--validation", "-va", default=200, type=int)
+    parser.add_argument("--test", "-tt", default=5000, type=int)
     parser.add_argument("--seed", "-sd", type=int, default=42)
     parser.add_argument("--randomize-noun", "-rn", action="store_true")
     

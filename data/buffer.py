@@ -4,7 +4,6 @@ import torch
 import random
 
 from datasets import load_from_disk, load_dataset
-# TODO : return attn mask !
 
 boolean_expressions_path = "/home/pyllm/dhimoila/feature-circuits-1/data/datasets/boolean_expressions/"
 gp_path = "/home/pyllm/dhimoila/feature-circuits-1/data/datasets/gp/"
@@ -249,6 +248,42 @@ def bool_buffer(
 
     return buffer
 
+def _gp_iter(
+        model,
+        batch_size,
+        device,
+        ctx_len=None,
+        split='train',
+        perm=None,
+        shuffle=False,
+):
+    gp_data = load_from_disk(gp_path)[split]
+
+    # sanity check
+    sanity_iter = custom_iter(iter(gp_data), text_field='prefix', corr_field='corr_prefix', good_field='pronoun', bad_field='corr_pronoun', add_space=True)
+    sanity_buffer = TokenBatches(
+        sanity_iter,
+        model,
+        ctx_len=None,
+        batch_size=1,
+        device=device,
+        max_number_of_yields=gp_data.num_rows,
+        corr_field='corr',
+        good_field='good',
+        bad_field='bad',
+    )
+    selection = sanitize_data(gp_data, sanity_buffer)
+    gp_data = gp_data.select(selection.nonzero().squeeze())
+
+    # actual buffer
+    if perm is not None:
+        gp_data = gp_data.select(perm)
+    elif shuffle:
+        gp_data = gp_data.shuffle()
+    gp_iter = custom_iter(iter(gp_data), text_field='prefix', corr_field='corr_prefix', good_field='pronoun', bad_field='corr_pronoun', add_space=True)#, text_field=['prefix', 'pronoun'], corr_field=['corr_prefix', 'corr_pronoun'])
+
+    return gp_iter, gp_data.num_rows
+
 def gp_buffer(
         model,
         batch_size,
@@ -258,32 +293,56 @@ def gp_buffer(
         perm=None,
         shuffle=False,
 ):
-    raise NotImplementedError("Check that this function is still working")
-    path = gp_path
-    if model_name != "":
-        path = path + model_name + "/"
-        if not os.path.exists(path):
-            path = gp_path
-    gp_data = load_from_disk(path)[split]
-    if perm is not None:
-        gp_data = gp_data.select(perm)
-    elif shuffle:
-        gp_data = gp_data.shuffle()
-    gp_iter = custom_iter(iter(gp_data), text_field='prefix', corr_field='corr_prefix', good_field='pronoun', bad_field='corr_pronoun', add_space=True)#, text_field=['prefix', 'pronoun'], corr_field=['corr_prefix', 'corr_pronoun'])
-
+    gp_iter, n = _gp_iter(model, batch_size, device, ctx_len, split, perm, shuffle)
     buffer = TokenBatches(
         gp_iter,
         model,
         ctx_len=None,
         batch_size=batch_size,
         device=device,
-        max_number_of_yields=gp_data.num_rows,
+        max_number_of_yields=n,
         corr_field='corr',
         good_field='good',
         bad_field='bad',
     )
 
     return buffer
+
+def _gt_iter(
+        model,
+        batch_size,
+        device,
+        ctx_len=None,
+        split='train',
+        perm=None,
+        shuffle=False,
+):
+    gt_data = load_from_disk(gt_path)[split]
+
+    # sanity check
+    sanity_iter = custom_iter(iter(gt_data), text_field='prefix', corr_field='corr_prefix', good_field='good', bad_field='bad')
+    sanity_buffer = TokenBatches(
+        sanity_iter,
+        model,
+        ctx_len=None,
+        batch_size=1,
+        device=device,
+        max_number_of_yields=gt_data.num_rows,
+        corr_field='corr',
+        good_field='good',
+        bad_field='bad',
+    )
+    selection = sanitize_data(gt_data, sanity_buffer)
+    gt_data = gt_data.select(selection.nonzero().squeeze())
+
+    # actual buffer
+    if perm is not None:
+        gt_data = gt_data.select(perm)
+    elif shuffle:
+        gt_data = gt_data.shuffle()
+    gt_iter = custom_iter(iter(gt_data), text_field='prefix', corr_field='corr_prefix', good_field='good', bad_field='bad')
+
+    return gt_iter, gt_data.num_rows
 
 def gt_buffer(
         model,
@@ -294,26 +353,14 @@ def gt_buffer(
         perm=None,
         shuffle=False,
 ):
-    raise NotImplementedError("Check that this function is still working")
-    path = gt_path
-    if model_name != "":
-        path = path + model_name + "/"
-        if not os.path.exists(path):
-            path = gt_path
-    gt_data = load_from_disk(path)[split]
-    if perm is not None:
-        gt_data = gt_data.select(perm)
-    elif shuffle:
-        gt_data = gt_data.shuffle()
-    gt_iter = custom_iter(iter(gt_data), text_field='prefix', corr_field='corr_prefix', good_field='good', bad_field='bad')
-
+    gt_iter, n = _gt_iter(model, batch_size, device, ctx_len, split, perm, shuffle)
     buffer = TokenBatches(
         gt_iter,
         model,
         ctx_len=None,
         batch_size=batch_size,
         device=device,
-        max_number_of_yields=gt_data.num_rows,
+        max_number_of_yields=n,
         corr_field='corr',
         good_field='good',
         bad_field='bad',
@@ -321,7 +368,7 @@ def gt_buffer(
     
     return buffer
 
-def ioi_buffer(
+def _ioi_iter(
         model,
         batch_size,
         device,
@@ -354,13 +401,25 @@ def ioi_buffer(
         ioi_data = ioi_data.shuffle()
     ioi_iter = custom_iter(iter(ioi_data), text_field='ioi_sentences', corr_field='corr_ioi_sentences', good_field='a', bad_field='b', add_space=True)#, text_field=['ioi_sentences', 'a'], corr_field=['corr_ioi_sentences', 'b'])
 
+    return ioi_iter, ioi_data.num_rows
+
+def ioi_buffer(
+        model,
+        batch_size,
+        device,
+        ctx_len=None,
+        split='train',
+        perm=None,
+        shuffle=False,
+):
+    ioi_iter, n = _ioi_iter(model, batch_size, device, ctx_len, split, perm, shuffle)
     buffer = TokenBatches(
         ioi_iter,
         model,
         ctx_len=None,
         batch_size=batch_size,
         device=device,
-        max_number_of_yields=ioi_data.num_rows,
+        max_number_of_yields=n,
         corr_field='corr',
         good_field='good',
         bad_field='bad',
@@ -368,7 +427,7 @@ def ioi_buffer(
     
     return buffer
 
-def rc_buffer(
+def _rc_iter(
         model,
         batch_size,
         device,
@@ -402,13 +461,25 @@ def rc_buffer(
         rc_data = rc_data.shuffle()
     rc_iter = custom_iter(iter(rc_data), text_field='clean_prefix', corr_field='patch_prefix', good_field='clean_answer', bad_field='patch_answer')
 
+    return rc_iter, rc_data.num_rows
+
+def rc_buffer(
+        model,
+        batch_size,
+        device,
+        ctx_len=None,
+        split='train',
+        perm=None,
+        shuffle=False,
+):
+    rc_iter, n = _rc_iter(model, batch_size, device, ctx_len, split, perm, shuffle)
     buffer = TokenBatches(
         rc_iter,
         model,
         ctx_len=None,
         batch_size=batch_size,
         device=device,
-        max_number_of_yields=rc_data.num_rows,
+        max_number_of_yields=n,
         corr_field='corr',
         good_field='good',
         bad_field='bad',
@@ -416,7 +487,7 @@ def rc_buffer(
 
     return buffer
 
-def simple_rc_buffer(
+def _simple_rc_iter(
         model,
         batch_size,
         device,
@@ -450,13 +521,25 @@ def simple_rc_buffer(
         rc_data = rc_data.shuffle()
     rc_iter = custom_iter(iter(rc_data), text_field='clean_prefix', corr_field='patch_prefix', good_field='clean_answer', bad_field='patch_answer')
 
+    return rc_iter, rc_data.num_rows
+
+def simple_rc_buffer(
+        model,
+        batch_size,
+        device,
+        ctx_len=None,
+        split='train',
+        perm=None,
+        shuffle=False,
+):
+    rc_iter, n = _simple_rc_iter(model, batch_size, device, ctx_len, split, perm, shuffle)
     buffer = TokenBatches(
         rc_iter,
         model,
         ctx_len=None,
         batch_size=batch_size,
         device=device,
-        max_number_of_yields=rc_data.num_rows,
+        max_number_of_yields=n,
         corr_field='corr',
         good_field='good',
         bad_field='bad',
@@ -470,15 +553,14 @@ def mixture_buffer(
         device,
         ctx_len=None,
         split='train',
+        perm=None,
+        shuffle=False,
 ):
-    raise NotImplementedError("Implement shuffle, perm and model_name")
-    gp_data = load_from_disk(gp_path)[split].shuffle()
-    gp_iter = custom_iter(iter(gp_data), text_field='prefix', corr_field='corr_prefix', good_field='pronoun', bad_field='corr_pronoun', add_space=True)#, text_field=['prefix', 'pronoun'], corr_field=['corr_prefix', 'corr_pronoun'])
-    gt_data = load_from_disk(gt_path)[split].shuffle()
-    gt_iter = custom_iter(iter(gt_data), text_field='prefix', corr_field='corr_prefix', good_field='good', bad_field='bad')
-    ioi_data = load_from_disk(ioi_path)[split].shuffle()
-    ioi_iter = custom_iter(iter(ioi_data), text_field='ioi_sentences', corr_field='corr_ioi_sentences', good_field='a', bad_field='b', add_space=True)#, text_field=['ioi_sentences', 'a'], corr_field=['corr_ioi_sentences', 'b'])
-
+    gp_iter, n1 = _gp_iter(model, batch_size, device, ctx_len, split, perm, shuffle)
+    gt_iter, n2 = _gt_iter(model, batch_size, device, ctx_len, split, perm, shuffle)
+    ioi_iter, n3 = _ioi_iter(model, batch_size, device, ctx_len, split, perm, shuffle)
+    rc_iter, n4 = _rc_iter(model, batch_size, device, ctx_len, split, perm, shuffle)
+    
     class random_iter:
         def __init__(self, datasets):
             self.datasets = datasets
@@ -487,15 +569,21 @@ def mixture_buffer(
             return self
         
         def __next__(self):
-            return next(random.choice(self.datasets))
+            while self.datasets != []:
+                to_next = random.choice(self.datasets)
+                try:
+                    return next(to_next)
+                except StopIteration:
+                    self.datasets.remove(to_next)
+            raise StopIteration
         
     buffer = TokenBatches(
-        random_iter([gp_iter, gt_iter, ioi_iter]),
+        random_iter([gp_iter, gt_iter, ioi_iter, rc_iter]),
         model,
         ctx_len=None,
         batch_size=batch_size,
         device=device,
-        max_number_of_yields=min(gp_data.num_rows, gt_data.num_rows, ioi_data.num_rows) * 3,
+        max_number_of_yields=n1 + n2 + n3 + n4,
         corr_field='corr',
         good_field='good',
         bad_field='bad',
