@@ -65,7 +65,7 @@ def _get_edge_attr_feature(
     # used for resid layers. If upstreams include the current layer's attn and mlp, do not do the full forward pass
     # In that case, resid_{l+1} = attn_{l+1} + mlp_{l+1} + resid_{l} (or upstreams of resid_{l} if the current
     #                                                                 settings do not include resid_{l}).
-    # Otherwise, resid_{l+1} = resid_{l}
+    # Otherwise, resid_{l+1} = f(resid_{l})
     do_the_forward = True
     for up in upstreams:
         if up != 'embed' and not downstream == 'y':
@@ -238,6 +238,7 @@ def _get_edge_attr_feature(
 
 def _get_edge_attr_roi():
     """
+    TODO
     Helper function for get_circuit_roi.
     """
     pass

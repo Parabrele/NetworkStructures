@@ -1,3 +1,10 @@
+import graph_tool.all as gt
+
+import os
+
+import random
+import numpy as np
+
 import torch
 
 from nnsight.models.UnifiedTransformer import UnifiedTransformer
@@ -8,6 +15,22 @@ from utils.utils import Submod
 from utils.dictionary import IdentityDict
 
 # TODO : load model with from_pretrained_no_processing(..., **cfg.model_from_pretrained_kwargs)"
+
+def seed_all(seed: int):
+    """
+    Set random seed for all libraries.
+    To be used only in sequential code.
+    """
+    # Set python hash seed to disable hash randomization and make hash based data structures / operations deterministic
+    os.environ["PYTHONHASHSEED"] = "0"
+
+    # Set random seed for all libraries
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    gt.seed_rng(seed)
+
 
 model_name_to_processing = {
     "pythia-70m-deduped" : False,
@@ -205,3 +228,28 @@ def load_saes(
         dictionaries[k].to(name2mod[k].module.cfg.device)
 
     return dictionaries
+
+# TODO
+class SanityChecks:
+    def __init__(self, model, name2mod, dictionaries):
+        self.model = model
+        self.name2mod = name2mod
+        self.dictionaries = dictionaries
+
+    def SAE_setup(self):
+        # Check for L1, L0, Variance Explained
+        ...
+
+    def solve_task(self, task):
+        # Check that the model can solve the task. Otherwise, we are looking for something that is not there.
+        ...
+    
+    def multi_GPU(self):
+        # Check that forward passes and all operations are correctly handled in the current configuration.
+        # TODO : print all GPU used and their usage + run some dummy passes to check that everything is working.
+        ...
+    
+    def check_all(self, task):
+        self.SAE_setup()
+        self.solve_task(task)
+        self.multi_GPU()

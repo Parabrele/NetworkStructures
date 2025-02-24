@@ -170,3 +170,7 @@ data/runs/*
 *.err
 
 *.pyc
+
+.gitignore
+
+access_token.txt
